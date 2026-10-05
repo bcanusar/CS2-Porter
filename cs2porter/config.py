@@ -69,6 +69,8 @@ DEFAULTS = {
     "tool_paths": {},
     # folders with Source 1 files (materials/, models/ ...) searched before the installed games
     "resource_dirs": [],
+    # an update the user chose to skip (its tag)
+    "skip_update": "",
     "opts": {
         "overwrite": False,
         "convert_cs2_existing": False,

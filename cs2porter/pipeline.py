@@ -23,8 +23,8 @@ from . import uvfix
 from . import vmap as vmapmod
 from . import vmf as vmfmod
 from .i18n import t, t_en
-from .materials import (BROKEN_CABLE_MATERIALS, MaterialConverter, out_name, write_black_material,
-                        write_cable_fallback)
+from .materials import (BROKEN_CABLE_MATERIALS, MaterialConverter, MaterialResult, out_name,
+                        write_black_material, write_cable_fallback, write_stand_in_material)
 from .models import ModelConverter, QCIndex, norm_model
 from .skybox import MOONDOME_VMAT, SKY_VMAT, build_skybox
 from .sources import AssetSources, CS2Index, DirSource, VPKSource
@@ -888,13 +888,52 @@ def _detail_files(ctx, folder, key):
         ctx.detail(t(key, n=sum(kinds.values()), list=", ".join(f"{k} {n}" for k, n in kinds.most_common())))
 
 
-def compile_assets(cfg, ctx, valve, content_dir, game_dir, work):
+_VMDL_MATERIAL = re.compile(r'"(materials/[^"\r\n]+?\.vmat)"', re.IGNORECASE)
+
+
+def _stand_in_model_materials(cfg, ctx, report, content_dir, game_dir):
+    """Models that still wait for their compiled file and use a material that exists nowhere
+    (not in the addon, not in CS2) get a plain gray one, or they can not be compiled."""
+    wanted = {}
+    for dp, _dn, fn in os.walk(os.path.join(content_dir, "models")):
+        for f in fn:
+            if not f.lower().endswith(".vmdl"):
+                continue
+            src = os.path.join(dp, f)
+            out = os.path.join(game_dir, os.path.relpath(src, content_dir)) + "_c"
+            if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+                continue
+            try:
+                with open(src, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for m in _VMDL_MATERIAL.findall(text):
+                wanted.setdefault(m.replace("\\", "/").lower(), None)
+    if not wanted:
+        return
+    index = CS2Index(cfg.get("cs2_dir", ""), content_dir, game_dir)
+    made = []
+    for rel in sorted(wanted):
+        if index.in_addon(rel) or index.in_cs2(rel + "_c"):
+            continue
+        write_stand_in_material(content_dir, rel)
+        made.append(rel)
+        name = rel[len("materials/"):-len(".vmat")]
+        if report is not None and name not in report.materials:
+            report.materials[name] = MaterialResult(name, "missing", t("m_no_vmt"))
+    if made:
+        ctx.log(t("p_model_mat_stand_in", n=len(made)), "warn")
+
+
+def compile_assets(cfg, ctx, valve, content_dir, game_dir, work, report=None):
     """Compiles the addon's materials and models (vmat_c / vmdl_c) into its game folder, so
     Hammer does not have to do it the first time the map is opened. Only files without an
     up to date compiled version are given to the compiler. The map itself is never compiled."""
     if not cfg["opts"].get("compile_assets", True) or not game_dir or valve is None \
             or not valve.has_resourcecompiler:
         return
+    _stand_in_model_materials(cfg, ctx, report, content_dir, game_dir)
     todo = []
     for sub, ext in (("materials", ".vmat"), ("materials", ".vtex"), ("models", ".vmdl"), ("particles", ".vpcf")):
         base = os.path.join(content_dir, sub)
@@ -1253,7 +1292,7 @@ def port_map(cfg, ctx, input_path, addon_name):
         sources.close()
     ctx.check()
     if cs2_ok:
-        compile_assets(cfg, ctx, valve, content_dir, game_dir, work)
+        compile_assets(cfg, ctx, valve, content_dir, game_dir, work, report)
     for note in report.notices:
         ctx.log(note, "warn")
 
@@ -1759,6 +1798,6 @@ def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=
         sources.close()
     _summary(ctx, report)
     if cs2_ok and game_dir:
-        compile_assets(cfg, ctx, valve, content_dir, game_dir, work)
+        compile_assets(cfg, ctx, valve, content_dir, game_dir, work, report)
     _finish(ctx, report, work, t_en("report_title_missing"), t0)
     return report

@@ -13,7 +13,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, ttk
 
-from . import __version__, bsp as bspmod, config, i18n, pipeline, tools
+from . import __version__, bsp as bspmod, config, i18n, pipeline, tools, updater
 from .i18n import t
 from .valve_tools import Cancelled, ToolError
 
@@ -2834,6 +2834,10 @@ class App:
                         ev.set()
                 elif kind == "done":
                     self._job_done(*item[1:])
+                    if getattr(self, "_pending_update", None) is not None:
+                        self._offer_update(self._pending_update)
+                elif kind == "update":
+                    self._offer_update(item[1])
         except queue.Empty:
             pass
         self.root.after(40 if n else 80, self._poll)
@@ -2860,6 +2864,9 @@ class App:
             return
         self.progress["value"] = 1000
         self.status.config(text=t("status_done", title=title, sec=elapsed))
+        if isinstance(report, updater.Staged):
+            self._install_update(report)
+            return
         if report is not None:
             if getattr(report, "content_dir", "") and self.current_table is not None:
                 self.current_table.content_dir = report.content_dir
@@ -2942,6 +2949,80 @@ class App:
             self.log(t("startup_no_bspsource", path=config.BSPSOURCE_DIR), "warn")
         if not self._s1_dirs():
             self.log(t("startup_no_games"), "warn")
+        threading.Thread(target=self._check_update, daemon=True).start()
+
+    # --- updates ---------------------------------------------------------------
+    def _check_update(self):
+        """Worker thread: asks for a newer version (silent when offline)."""
+        try:
+            rel = updater.newer_release()
+        except OSError:
+            return
+        if rel is not None:
+            self.queue.put(("update", rel))
+
+    def _offer_update(self, rel):
+        if self.worker and self.worker.is_alive():
+            # not in the middle of a job: asked once the job is over
+            self._pending_update = rel
+            return
+        self._pending_update = None
+        self.log(t("upd_available", v=rel.tag), "warn")
+        if self.cfg.get("skip_update") == rel.tag:
+            return
+        text = t("upd_msg", new=rel.tag, cur="v" + __version__)
+        notes = updater.plain_notes(rel.notes)
+        if notes:
+            text += "\n\n" + t("upd_notes") + "\n\n" + notes
+        res = Dialog(self.root, t("upd_title"), text, "info", ("update", "skip", "later"),
+                     self.cfg["theme"] == "dark").result
+        if res == "skip":
+            self.cfg["skip_update"] = rel.tag
+        elif res == "update":
+            self._run_update(rel)
+
+    def _run_update(self, rel):
+        if not updater.can_install() or not rel.zip_url:
+            self.log(t("upd_open_page"), "info")
+            webbrowser.open(rel.page)
+            return
+
+        def job(ctx):
+            ctx.log(t("upd_downloading", v=rel.tag), "head")
+
+            def progress(got, total):
+                mb = 1024 * 1024
+                ctx.progress(got / total if total else 0.0,
+                             t("upd_progress", got=got // mb, total=total // mb if total else "?"))
+
+            try:
+                staged = updater.download(rel, progress, ctx.cancel.is_set)
+            except OSError as e:
+                raise ToolError(t("upd_failed", e=e)) from e
+            if staged is None:
+                raise Cancelled()
+            return staged
+
+        self._start_job(job, t("job_update"), None)
+
+    def _install_update(self, staged):
+        try:
+            updater.start_install(staged)
+        except OSError as e:
+            self._append_log(t("upd_failed", e=e), "err")
+            self._msg(t("upd_title"), t("upd_failed", e=e), "error")
+            return
+        self._append_log(t("upd_restart"), "ok")
+        self.root.after(400, self._close_for_update)
+
+    def _close_for_update(self):
+        try:
+            self._collect_settings()
+            self.cfg["maximized"] = self.root.state() == "zoomed"
+            config.save(self.cfg)
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.destroy()
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():
