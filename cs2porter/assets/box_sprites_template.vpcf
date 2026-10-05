@@ -1,0 +1,201 @@
+<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:vpcf66:version{dd571be4-586e-4f41-8b2d-5bbc969e1c53} -->
+{
+	_class = "CParticleSystemDefinition"
+	m_nBehaviorVersion = 12
+	m_nMaxParticles = $max_particles
+	m_flMaxDrawDistance = $draw_distance
+	m_flConstantRadius = $radius_max
+	m_controlPointConfigurations =
+	[
+		{
+			m_name = "preview"
+			m_drivers =
+			[
+				{
+					m_iAttachType = "PATTACH_WORLDORIGIN"
+					m_entityName = "self"
+				},
+				{
+					m_iControlPoint = 1
+					m_iAttachType = "PATTACH_WORLDORIGIN"
+					m_vecOffset = [ 256.0, 256.0, 128.0 ]
+					m_entityName = "self"
+				},
+				{
+					m_iControlPoint = 2
+					m_iAttachType = "PATTACH_WORLDORIGIN"
+					m_vecOffset = [ 255.0, 160.0, 80.0 ]
+					m_entityName = "self"
+				},
+			]
+		},
+	]
+	m_Emitters =
+	[
+		{
+			_class = "C_OP_ContinuousEmitter"
+			m_flEmitRate =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $rate
+			}
+		},
+	]
+	m_Initializers =
+	[
+		{
+			_class = "C_INIT_CreateWithinBox"
+			m_bLocalSpace = false
+			m_vecMin =
+			{
+				m_nType = "PVEC_TYPE_FLOAT_COMPONENTS"
+				m_FloatComponentX =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 0
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = -0.5
+				}
+				m_FloatComponentY =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 1
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = -0.5
+				}
+				m_FloatComponentZ =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 2
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = -0.5
+				}
+			}
+			m_vecMax =
+			{
+				m_nType = "PVEC_TYPE_FLOAT_COMPONENTS"
+				m_FloatComponentX =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 0
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = 0.5
+				}
+				m_FloatComponentY =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 1
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = 0.5
+				}
+				m_FloatComponentZ =
+				{
+					m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+					m_nControlPoint = 1
+					m_nVectorComponent = 2
+					m_nMapType = "PF_MAP_TYPE_MULT"
+					m_flMultFactor = 0.5
+				}
+			}
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_RANDOM_UNIFORM"
+				m_flRandomMin = $life_min
+				m_flRandomMax = $life_max
+			}
+			m_nOutputField = 1
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_RANDOM_UNIFORM"
+				m_flRandomMin = $radius_min
+				m_flRandomMax = $radius_max
+			}
+			m_nOutputField = 3
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $alpha
+			}
+			m_nOutputField = 7
+		},
+		{
+			_class = "C_INIT_VelocityRandom"
+			m_LocalCoordinateSystemSpeedMin =
+			{
+				m_nType = "PVEC_TYPE_LITERAL"
+				m_vLiteralValue = [ $vel_min ]
+			}
+			m_LocalCoordinateSystemSpeedMax =
+			{
+				m_nType = "PVEC_TYPE_LITERAL"
+				m_vLiteralValue = [ $vel_max ]
+			}
+		},
+	]
+	m_Operators =
+	[
+		{
+			_class = "C_OP_BasicMovement"
+		},
+		{
+			_class = "C_OP_Decay"
+		},
+		{
+			_class = "C_OP_InterpolateRadius"
+			m_flStartScale = 1.0
+			m_flEndScale = $end_scale
+		},
+		{
+			_class = "C_OP_FadeIn"
+			m_flFadeInTimeMin = $fade_in
+			m_flFadeInTimeMax = $fade_in
+			m_bProportional = true
+		},
+		{
+			_class = "C_OP_FadeOut"
+			m_flFadeOutTimeMin = $fade_out
+			m_flFadeOutTimeMax = $fade_out
+			m_bProportional = true
+		},
+		{
+			_class = "C_OP_RemapCPtoVector"
+			m_nCPInput = 2
+			m_nFieldOutput = 6
+			m_vInputMax = [ 255.0, 255.0, 255.0 ]
+			m_vOutputMax = [ 1.0, 1.0, 1.0 ]
+		},
+	]
+	m_Renderers =
+	[
+		{
+			_class = "C_OP_RenderSprites"
+			m_nOutputBlendMode = "PARTICLE_OUTPUT_BLEND_MODE_ADD"
+			m_vecTexturesInput =
+			[
+				{
+					m_hTexture = resource:"materials/particles/light_flare/light_glow_01.vtex"
+					m_nTextureBlendMode = "SPRITECARD_TEXTURE_BLEND_MOD2X"
+					m_flTextureBlend =
+					{
+						m_nType = "PF_TYPE_LITERAL"
+						m_flLiteralValue = 1.2
+					}
+				},
+			]
+		},
+	]
+}

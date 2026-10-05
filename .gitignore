@@ -1,0 +1,21 @@
+# personal files the program writes next to itself
+settings.json
+cache/
+error_log.txt
+
+# third party tools: every user downloads them (see tools/README.md)
+tools/*
+!tools/README.md
+
+# build output
+CS2 Porter.exe
+*.exe
+build/dist/
+build/work/
+build/version_info.txt
+release/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
