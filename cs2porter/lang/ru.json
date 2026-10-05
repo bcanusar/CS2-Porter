@@ -33,6 +33,7 @@
  "startup_no_workshop_tools": "CS2 Workshop Tools не установлены. В Steam: Counter-Strike 2 > Свойства > DLC > Counter-Strike 2 Workshop Tools.",
  "startup_no_bspsource": "Нет декомпилятора карт: папка {path} пуста. Где его взять, написано в README.",
  "startup_no_cs2": "Папка CS2 не найдена. Её можно выбрать в настройках.",
+ "startup_cs2_path": "CS2 установлена в папку с нелатинскими буквами. Инструменты CS2 не читают такие пути, поэтому перенесите библиотеку Steam в папку только с латинскими буквами.",
  "startup_no_res": "Папка Resources не найдена. Её можно выбрать в настройках.",
  "pick_folder": "Выберите папку",
  "all_files": "Все файлы",

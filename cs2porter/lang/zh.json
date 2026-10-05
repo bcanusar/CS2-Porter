@@ -33,6 +33,7 @@
  "startup_no_workshop_tools": "未安装 CS2 Workshop Tools。在 Steam 中：Counter-Strike 2 > 属性 > DLC > Counter-Strike 2 Workshop Tools。",
  "startup_no_bspsource": "缺少地图反编译器：{path} 为空。获取方式见 README。",
  "startup_no_cs2": "未找到 CS2 文件夹。可以在设置中选择。",
+ "startup_cs2_path": "CS2 安装在含有非拉丁字母的文件夹中。CS2 工具无法读取这类路径，请将 Steam 库移到只含拉丁字母的文件夹。",
  "startup_no_res": "未找到 Resources 文件夹。可以在设置中选择。",
  "pick_folder": "选择文件夹",
  "all_files": "所有文件",

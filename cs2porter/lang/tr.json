@@ -33,6 +33,7 @@
  "startup_no_workshop_tools": "CS2 Workshop Tools kurulu değil. Steam'de: Counter-Strike 2 > Özellikler > DLC > Counter-Strike 2 Workshop Tools.",
  "startup_no_bspsource": "Harita açıcı eksik: {path} boş. Nereden alınacağı README dosyasında yazıyor.",
  "startup_no_cs2": "CS2 klasörü bulunamadı. Ayarlar sekmesinden seçebilirsin.",
+ "startup_cs2_path": "CS2, Latin dışı harfler içeren bir klasöre kurulu. CS2 araçları böyle yolları okuyamıyor; Steam kütüphanesini yalnızca Latin harfli bir klasöre taşı.",
  "startup_no_res": "Resources klasörü bulunamadı. Ayarlar sekmesinden seçebilirsin.",
  "pick_folder": "Klasör seç",
  "all_files": "Tüm dosyalar",

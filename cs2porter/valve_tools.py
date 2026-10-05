@@ -186,7 +186,8 @@ def decompile_bsp(bsp, out_vmf, log=None, cancel=None, bspsource_dir=None):
     if os.path.isfile(out_vmf):
         os.remove(out_vmf)
     os.makedirs(os.path.dirname(out_vmf), exist_ok=True)
-    args = cmd + [bsp, "-o", out_vmf]
+    out_dir = config.short_path(os.path.dirname(out_vmf))
+    args = cmd + [config.short_path(bsp), "-o", os.path.join(out_dir, os.path.basename(out_vmf))]
     code, out = run_process(args, log=log, cancel=cancel, idle_timeout=600, echo=False)
     if not os.path.isfile(out_vmf):
         tail = "\n".join(out.splitlines()[-8:])

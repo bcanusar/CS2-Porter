@@ -335,22 +335,60 @@ def s1_game_names(gamedirs):
     return names
 
 
+def _tool_safe(path):
+    """The CS2 tools fail on paths with spaces or non-ASCII letters (a user name like Илья)."""
+    return path.isascii() and " " not in path
+
+
+def short_path(path):
+    """The 8.3 name of an existing path with non-ASCII letters, for tools that read their
+    arguments in the ANSI code page. Returns the path as it is when there is no such name."""
+    if path.isascii():
+        return path
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) and buf.value.isascii():
+            return buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    return path
+
+
+def _writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_test")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def work_root():
-    """Picks a work folder without spaces, since the CS2 tools fail on paths with spaces."""
+    """Picks a work folder the CS2 tools can read: no spaces, only ASCII letters."""
     base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
     path = os.path.join(base, "CS2Porter", "work")
-    if " " not in path:
+    if _tool_safe(path):
         return path
     try:
         import ctypes
         os.makedirs(path, exist_ok=True)
         buf = ctypes.create_unicode_buffer(1024)
-        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) and " " not in buf.value:
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) and _tool_safe(buf.value):
             return buf.value
     except Exception:  # noqa: BLE001
         pass
-    drive = os.environ.get("SystemDrive", "C:")
-    return os.path.join(drive + os.sep, "CS2PorterWork")
+    drive = os.environ.get("SystemDrive", "C:") + os.sep
+    candidates = [os.path.join(drive, "CS2PorterWork")]
+    if _tool_safe(os.environ.get("ProgramData", "")):
+        candidates.append(os.path.join(os.environ["ProgramData"], "CS2Porter", "work"))
+    for c in candidates:
+        if _writable(c):
+            return c
+    return candidates[0]
 
 
 def autodetect(cfg, only_missing=False):

@@ -33,6 +33,7 @@
  "startup_no_workshop_tools": "The CS2 Workshop Tools are not installed. In Steam: Counter-Strike 2 > Properties > DLC > Counter-Strike 2 Workshop Tools.",
  "startup_no_bspsource": "The map decompiler is missing: {path} is empty. The README says where to get it.",
  "startup_no_cs2": "CS2 folder not found. You can pick it in Settings.",
+ "startup_cs2_path": "CS2 is installed in a folder with non-Latin letters. The CS2 tools can not read such paths, so move the Steam library to a folder with only Latin letters.",
  "startup_no_res": "Resources folder not found. You can pick it in Settings.",
  "pick_folder": "Select folder",
  "all_files": "All files",

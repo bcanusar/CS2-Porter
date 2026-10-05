@@ -2936,6 +2936,8 @@ class App:
             self.log(t("startup_no_cs2"), "warn")
         elif not os.path.isfile(os.path.join(cs2, "game", "bin", "win64", "source1import.exe")):
             self.log(t("startup_no_workshop_tools"), "warn")
+        if cs2 and not cs2.isascii():
+            self.log(t("startup_cs2_path"), "warn")
         if not config.find_bspsource():
             self.log(t("startup_no_bspsource", path=config.BSPSOURCE_DIR), "warn")
         if not self._s1_dirs():
