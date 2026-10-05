@@ -910,6 +910,7 @@ class App:
                 pass
         root.after(150, lambda: self._set_window_icons(ico))
         root.after(160, lambda: dark_title_bar(root, self.cfg["theme"] == "dark"))
+        root.after(170, self._enable_drop)
         self._style()
         self._build()
         self._show_shell()
@@ -942,6 +943,72 @@ class App:
                 w.winfo_toplevel().focus_set()
         except (AttributeError, tk.TclError):
             pass
+
+    def _enable_drop(self):
+        """Maps (.bsp / .vmf files, folders) dragged from Explorer onto the window go into the map
+        list. Tk has no drag and drop, so the window takes WM_DROPFILES itself."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32, shell32, comctl32 = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.comctl32
+            proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                           wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t)
+            comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, proc_type, ctypes.c_size_t, ctypes.c_size_t]
+            comctl32.DefSubclassProc.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+            shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p, wintypes.UINT]
+            shell32.DragQueryFileW.restype = wintypes.UINT
+            shell32.DragFinish.argtypes = [ctypes.c_void_p]
+            shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+            user32.ChangeWindowMessageFilterEx.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.DWORD,
+                                                           ctypes.c_void_p]
+            WM_DROPFILES = 0x0233
+
+            def proc(hwnd, msg, wparam, lparam, _id, _data):
+                if msg == WM_DROPFILES:
+                    paths = []
+                    try:
+                        n = shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
+                        for i in range(n):
+                            size = shell32.DragQueryFileW(wparam, i, None, 0) + 1
+                            buf = ctypes.create_unicode_buffer(size)
+                            shell32.DragQueryFileW(wparam, i, buf, size)
+                            paths.append(buf.value)
+                    finally:
+                        shell32.DragFinish(wparam)
+                    # no Tk calls inside the window procedure: the queue hands the paths to _poll
+                    self.queue.put(("drop", paths))
+                    return 0
+                return comctl32.DefSubclassProc(hwnd, msg, wparam, lparam)
+
+            self._drop_proc = proc_type(proc)  # kept alive as long as the window
+            self.root.update_idletasks()
+            hwnd = int(self.root.wm_frame(), 16)
+            # also when the program runs as administrator and Explorer does not
+            for m in (WM_DROPFILES, 0x004A, 0x0049):  # WM_COPYDATA, WM_COPYGLOBALDATA
+                user32.ChangeWindowMessageFilterEx(hwnd, m, 1, None)
+            comctl32.SetWindowSubclass(hwnd, self._drop_proc, 1, 0)
+            shell32.DragAcceptFiles(hwnd, True)
+        except (AttributeError, OSError, ValueError, tk.TclError):
+            pass
+
+    def _dropped(self, paths):
+        found = []
+        for p in paths:
+            if os.path.isdir(p):
+                for dp, _dn, fn in os.walk(p):
+                    found += [os.path.join(dp, f) for f in sorted(fn) if f.lower().endswith(".bsp")]
+            elif p.lower().endswith((".bsp", ".vmf")):
+                found.append(p)
+        if not found:
+            self._msg(t("tab_port"), t("port_drop_none"), "info")
+            return
+        if self.worker and self.worker.is_alive():
+            self._msg(t("busy_title"), t("busy_msg"), "info")
+            return
+        self.nb.select(self.tab_port)
+        self.cfg["last_bsp_dir"] = os.path.dirname(found[0])
+        self._add_maps(found)
 
     def _set_window_icons(self, ico):
         """The taskbar shows the window's small icon at 24 px (at 100 % scale); Tk gives it the
@@ -2838,6 +2905,8 @@ class App:
                         self._offer_update(self._pending_update)
                 elif kind == "update":
                     self._offer_update(item[1])
+                elif kind == "drop":
+                    self._dropped(item[1])
         except queue.Empty:
             pass
         self.root.after(40 if n else 80, self._poll)
