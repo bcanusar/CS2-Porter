@@ -315,7 +315,6 @@
  "p_compile": "正在把 {n} 个材质, 模型和粒子编译到 game 文件夹",
  "p_compile_done": "已编译: {n} / {total} ({sec:.1f} 秒)",
  "p_compile_failed": "{n} 个文件无法编译 (见上面的日志)",
- "p_model_mat_stand_in": "模型使用的 {n} 个材质在任何位置都找不到。已为它们生成纯灰色材质，以便模型可以编译。",
  "vf_boost": "{n} 个很薄的加速触发器已升高到 6 单位",
  "vm_glows": "  {n} 个发光精灵已变为 info_particle_system (particles/glow_particle.vpcf)",
  "vm_beams": "  env_beam / env_laser 会使 CS2 崩溃: {n} 个已变为粒子光束, {r} 个没有终点的已删除",

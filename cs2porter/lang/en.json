@@ -315,7 +315,6 @@
  "p_compile": "Compiling {n} materials, models and particles into the game folder",
  "p_compile_done": "Compiled: {n} / {total} ({sec:.1f} s)",
  "p_compile_failed": "{n} files could not be compiled (see the log above)",
- "p_model_mat_stand_in": "{n} materials that models use were not found anywhere. They got a plain gray material so the models can be compiled.",
  "vf_boost": "{n} thin boost triggers raised to 6 units",
  "vm_glows": "  {n} glow sprites became info_particle_system (particles/glow_particle.vpcf)",
  "vm_beams": "  env_beam / env_laser crash CS2: {n} became particle beams, {r} without an end point were removed",

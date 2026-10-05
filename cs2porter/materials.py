@@ -489,16 +489,6 @@ def write_cable_fallback(content_dir, overwrite=False):
     return CABLE_FALLBACK
 
 
-def write_stand_in_material(content_dir, vmat_rel):
-    """Plain gray material at materials/<vmat_rel> for a material a model needs but no game or
-    map file has: the compiler refuses a model whose material is missing."""
-    path = os.path.join(content_dir, *vmat_rel.split("/"))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(VC.TMPL_BASIC.format(color="[0.500000 0.500000 0.500000 0.000000]",
-                                     sysattr=VC.build_system_attributes("default")))
-
-
 BLACK_VMAT = "cs2porter/black"
 # plain black Source 1 materials: they become the program's own pure black, unlit material
 BLACK_MATERIALS = frozenset({"dev/black_simple", "cs_italy/black"})
