@@ -1234,6 +1234,8 @@ def port_map(cfg, ctx, input_path, addon_name):
             if res.stats.get("black"):
                 # black faces (also the ones the import itself gives a black material)
                 write_black_material(content_dir)
+            if res.stats.get("cables_black"):
+                write_cable_fallback(content_dir, overwrite=True)
             # the bhop script is only needed when the map has basevelocity / gravity / teleport outputs
             if bhop_on and res.bhop_outputs and game_dir:
                 bhop.install(game_dir, ctx.log, bhop_data, bhop_err)
@@ -1450,7 +1452,7 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
 
 _VMAP_REF_RE = re.compile(rb"((?:materials|models)/[A-Za-z0-9_\-./ +()]+?\.(?:vmat|vmdl))")
 _SKY_FACE_RE = re.compile(r"^skybox/(.+?)(?:_hdr)?(?:up|dn|lf|rt|ft|bk)$")
-_OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_moondome", "cs2porter/black")
+_OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_moondome", "cs2porter/black", "cs2porter/cable_black")
 
 
 def read_vmap_refs(path):
