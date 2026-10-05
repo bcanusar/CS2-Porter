@@ -160,6 +160,9 @@ def download(release, progress=None, cancelled=None):
     return Staged(release, folder, root)
 
 
+_BUNDLE_VARS = ("_MEIPASS2", "_PYI_", "_PYIBOOTLOADER")
+
+
 def _ps_quote(s):
     return "'" + s.replace("'", "''") + "'"
 
@@ -178,10 +181,13 @@ def start_install(staged):
     cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
            "-WindowStyle", "Hidden", "-EncodedCommand", encoded]
     flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    # the new exe must not inherit this one's unpack folder, which is deleted when this one closes
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(_BUNDLE_VARS)}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     try:
-        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
+        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, close_fds=True, env=env)
     except OSError:
-        subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True, env=env)
 
 
 def install_script(staged, exe, pids):
@@ -199,6 +205,8 @@ def install_script(staged, exe, pids):
         "  if ($LASTEXITCODE -lt 8) { break }",
         "  Start-Sleep -Seconds 1",
         "}",
+        "Get-ChildItem Env: | Where-Object { $_.Name -like '_MEIPASS2' -or $_.Name -like '_PYI*' } | "
+        "ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }",
         "Start-Process -FilePath $exe -WorkingDirectory $dst",
         "Start-Sleep -Seconds 2",
         "Remove-Item -LiteralPath $tmp -Recurse -Force",
