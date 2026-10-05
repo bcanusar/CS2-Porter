@@ -491,7 +491,7 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
                                staging_dir=staging_dir, log=ctx.log,
                                overwrite=opts.get("overwrite", False),
                                convert_cs2_existing=opts.get("convert_cs2_existing", False))
-    tools_skipped = {k for k in materials if _is_tool(k)}
+    tools_skipped = {k for k in materials if _is_tool(k) and not matconv.own_tool(k)}
     mats = {k: set(v) for k, v in materials.items() if k not in tools_skipped}
     total = max(1, len(models) + len(mats) + 1)
     done = 0
@@ -514,7 +514,7 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
             if r.status == "created":
                 report.created_files.append(os.path.join(content_dir, *(out_name(r.mdl[:-4]) + ".vmdl").split("/")))
                 for m in r.materials:
-                    if _is_tool(m):
+                    if _is_tool(m) and not matconv.own_tool(m.lower()):
                         tools_skipped.add(m.lower())
                     else:
                         mats.setdefault(m.lower(), set()).add("model")

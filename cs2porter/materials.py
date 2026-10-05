@@ -714,6 +714,15 @@ class MaterialConverter:
         src = self.sources.find(rel)
         return src, rel
 
+    def own_tool(self, mat):
+        """A tools/ material CS2 does not have, packed into the map by its author (custom trigger
+        or light textures): it is converted like any other material."""
+        o = out_name(mat)
+        if self.index.in_cs2(f"materials/{o}.vmat_c"):
+            return False
+        src = self.sources.find(f"materials/{mat}.vmt")
+        return src is not None and getattr(src, "role", "") == "embedded"
+
     def material_available(self, mat):
         """Is the material in the target / in CS2, or can it be found in a source?"""
         o = out_name(mat)
@@ -871,7 +880,7 @@ class MaterialConverter:
     def _convert(self, mat, usages):
         o = out_name(mat)
         vmat_rel = f"materials/{o}.vmat"
-        if mat.startswith("tools/") or mat.startswith("tools\\"):
+        if (mat.startswith("tools/") or mat.startswith("tools\\")) and not self.own_tool(mat):
             return MaterialResult(mat, "tool", t("m_tool"))
         if mat in BLACK_MATERIALS:
             # the faces are given the program's own black material in the .vmap
