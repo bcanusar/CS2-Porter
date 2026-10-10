@@ -1,13 +1,17 @@
 """'Tools' tab: tehlikeli91's scripts plus some extra helper tools.
 
-Every tool takes (input, output, options). An empty output means the input folder.
+The user adds files (or folders and archives, searched for the files a tool takes) to a list;
+items() turns them into the rows of that list and run_tool() converts the rows into the output
+folder. status(key, status, detail) reports each row's result (key: the row id or its file).
 """
 
 import contextlib
+import hashlib
 import os
 import re
 import shutil
 import threading
+import zipfile
 
 import numpy as np
 from PIL import Image
@@ -15,9 +19,7 @@ from PIL import Image
 from . import mdl as mdlmod
 from . import vtf as vtfmod
 from .i18n import t
-from .legacy import fbx_converter, jpg_converter, reset_folders
-from .legacy import vmat_converter as VC
-from .legacy import vmdl_converter as VD
+from .legacy import fbx_converter, jpg_converter, texnames
 
 _cwd_lock = threading.Lock()
 
@@ -27,6 +29,7 @@ _ANSI_TAGS = {"91": "err", "93": "warn", "92": "ok"}
 IMAGE_IN = {
     "TGA": (".tga",), "PNG": (".png",), "JPG": (".jpg", ".jpeg"), "BMP": (".bmp",),
     "VTF": (".vtf",), "DDS": (".dds",), "PSD": (".psd",), "WEBP": (".webp",), "TIFF": (".tif", ".tiff"),
+    "EXR": (".exr",),
 }
 IMAGE_OUT = ("PNG", "JPG", "TGA", "BMP", "WEBP", "TIFF", "VTF")
 _OUT_EXT = {"PNG": ".png", "JPG": ".jpg", "TGA": ".tga", "BMP": ".bmp", "WEBP": ".webp", "TIFF": ".tif", "VTF": ".vtf"}
@@ -95,190 +98,129 @@ def run_captured(fn, log):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def list_files(folder, exts, recursive, skip_dirs=("_temp",)):
-    exts = tuple(e.lower() for e in exts)
-    out = []
-    if recursive:
-        for dp, dn, fn in os.walk(folder):
-            dn[:] = sorted(d for d in dn if not d.startswith(skip_dirs))
-            for f in sorted(fn):
-                if f.lower().endswith(exts):
-                    out.append(os.path.join(dp, f))
-    else:
-        for f in sorted(os.listdir(folder)):
-            p = os.path.join(folder, f)
-            if os.path.isfile(p) and f.lower().endswith(exts):
-                out.append(p)
-    return out
+def _inputs(inp, exts, opts):
+    """The files a tool works on: the ones picked in the list."""
+    return sorted(opts.get("files") or (), key=lambda f: f.lower())
+
+
+def _report(status, key, st, detail=""):
+    if status is not None:
+        status(key, st, detail)
+
+
+def file_key(path):
+    return os.path.normcase(os.path.abspath(path))
 
 
 def _same(a, b):
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
-def _mirror(path, inp, out):
-    """Where a file from the input folder goes in the output folder."""
-    return os.path.join(out, os.path.relpath(path, inp))
+# ---------------------------------------------------------------------------
+# Adding files: folders are searched, archives (.zip, .rar, .7z) are unpacked into the work folder
+# ---------------------------------------------------------------------------
+
+ARCHIVE_EXTS = (".zip", ".rar", ".7z")
+ARCHIVE_PATTERN = " ".join("*" + e for e in ARCHIVE_EXTS)
 
 
-def _copy_to_output(files, inp, out, log):
-    if not files:
-        return
-    log(t("tl_copying", n=len(files)), "dim")
-    for f in files:
-        dst = _mirror(f, inp, out)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if not os.path.isfile(dst) or os.path.getmtime(dst) < os.path.getmtime(f):
-            shutil.copy2(f, dst)
+def _unpack_other(path, dest):
+    """.rar and .7z: Windows' own tar (libarchive) unpacks them; 7-Zip or WinRAR when it cannot."""
+    import subprocess
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    windir = os.environ.get("SystemRoot", r"C:\Windows")
+    tries = [[os.path.join(windir, "System32", "tar.exe"), "-xf", path, "-C", dest]]
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        tries.append([os.path.join(base, "7-Zip", "7z.exe"), "x", "-y", "-o" + dest, path])
+        tries.append([os.path.join(base, "WinRAR", "UnRAR.exe"), "x", "-y", "-idq", path, dest + os.sep])
+    err = None
+    for cmd in tries:
+        if not os.path.isfile(cmd[0]):
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, creationflags=flags, timeout=3600)
+        except (OSError, subprocess.SubprocessError) as e:
+            err = e
+            continue
+        if r.returncode == 0:
+            return
+        lines = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+        err = lines[-1] if lines else f"exit code {r.returncode}"
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest, exist_ok=True)
+    raise RuntimeError(err if err is not None else "no program to unpack the archive")
 
 
-def _content_root(folder):
-    """If the folder is inside a 'materials' folder, returns its parent, otherwise the folder itself."""
-    p = os.path.abspath(folder)
-    cur = p
-    while True:
-        if os.path.basename(cur).lower() == "materials":
-            return os.path.dirname(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return p
-        cur = parent
+def _zip_dir(path):
+    """Folder the archive is unpacked into (once; again when the archive changes)."""
+    from . import config
+    st = os.stat(path)
+    key = f"{file_key(path)}|{st.st_size}|{int(st.st_mtime)}"
+    stem = re.sub(r"[^\w\-]", "_", os.path.splitext(os.path.basename(path))[0])[:40]
+    d = os.path.join(config.work_root(), "_zips", f"{stem}_{hashlib.md5(key.encode()).hexdigest()[:8]}")
+    if not os.path.isdir(d):
+        part = d + ".part"
+        shutil.rmtree(part, ignore_errors=True)
+        os.makedirs(part, exist_ok=True)
+        try:
+            if path.lower().endswith(".zip"):
+                with zipfile.ZipFile(path) as zf:
+                    zf.extractall(part)
+            else:
+                _unpack_other(path, part)
+        except BaseException:
+            shutil.rmtree(part, ignore_errors=True)
+            raise
+        os.replace(part, d)
+    return d
+
+
+def expand_paths(paths, exts, log=None):
+    """Files with these extensions in the given paths: folders with their subfolders, and the
+    archives (also the ones in a folder or in another archive). Returns [(file, shown path)]; the
+    shown path of a file from an archive is the archive's path followed by the file's path in it."""
+    exts = tuple(e.lower() for e in exts)
+    out, seen = [], set()
+
+    def add(f, shown):
+        k = file_key(f)
+        if k not in seen:
+            seen.add(k)
+            out.append((f, shown))
+
+    def walk(d, shown_root):
+        for dp, dn, fn in os.walk(d):
+            dn.sort(key=str.lower)
+            for name in sorted(fn, key=str.lower):
+                p = os.path.join(dp, name)
+                shown = os.path.join(shown_root, os.path.relpath(p, d))
+                if name.lower().endswith(exts):
+                    add(p, shown)
+                elif name.lower().endswith(ARCHIVE_EXTS):
+                    unzip(p, shown)
+
+    def unzip(z, shown):
+        try:
+            walk(_zip_dir(z), shown)
+        except (OSError, zipfile.BadZipFile, RuntimeError, ValueError) as e:
+            if log:
+                log(t("tl_zip_fail", f=os.path.basename(z), e=e), "warn")
+
+    for p in paths:
+        p = os.path.normpath(p)
+        if os.path.isdir(p):
+            walk(p, p)
+        elif p.lower().endswith(ARCHIVE_EXTS) and os.path.isfile(p):
+            unzip(p, p)
+        elif p.lower().endswith(exts) and os.path.isfile(p):
+            add(p, p)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
-
-_TEX_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tga")
-
-
-def run_vmat(inp, out, opts, log):
-    rec = opts.get("recursive", True)
-    work = inp
-    if out and not _same(out, inp):
-        files = list_files(inp, _TEX_EXTS, rec)
-        for extra in ("texture_info.txt", os.path.join("Missing Textures", "texture_info.txt")):
-            p = os.path.join(inp, extra)
-            if os.path.isfile(p):
-                files.append(p)
-        _copy_to_output(files, inp, out, log)
-        work = out
-    base = _content_root(work)
-
-    def job():
-        VC.set_base_dir(base)
-        stats = {"ok": 0}
-        txt = None
-        for cand in (os.path.join(base, "Missing Textures", "texture_info.txt"),
-                     os.path.join(base, "texture_info.txt"),
-                     os.path.join(work, "texture_info.txt")):
-            if os.path.isfile(cand):
-                txt = cand
-                break
-        skip = set()
-        if txt:
-            skip = VC.convert_from_txt(VC.parse_texture_info(txt), stats)
-        files = list_files(work, _TEX_EXTS, rec)
-        print(f"  Found {len(files)} texture file(s) to scan")
-        for f in files:
-            VC.convert_file(os.path.dirname(f), os.path.basename(f), stats, skip)
-        tmp = os.path.join(base, "_temp_fixed_vmat")
-        if os.path.isdir(tmp):
-            shutil.rmtree(tmp, ignore_errors=True)
-        print(f"\nDONE  VMAT files created: {stats['ok']}")
-
-    run_captured(job, log)
-
-
-def run_vmdl(inp, out, opts, log):
-    rec = opts.get("recursive", True)
-    work = inp
-    if out and not _same(out, inp):
-        files = list_files(inp, (".qc", ".smd", ".vta", ".vrd", ".vmat"), rec)
-        _copy_to_output(files, inp, out, log)
-        work = out
-    qcs = list_files(work, (".qc",), rec)
-    if opts.get("fix_rotation", True):
-        _fix_qc_rotation(qcs, log)
-
-    def job():
-        print(f"Root Folder: {work}")
-        vmat_index = VD.build_vmat_index(work)
-        print(f"Found .qc file: {len(qcs)}")
-        collector = {}
-        created = skipped = 0
-        for qc in qcs:
-            if VD.process_qc_file(qc, work, vmat_index, collector):
-                created += 1
-            else:
-                skipped += 1
-        if collector:
-            VD.write_vmat_ref_file(work, collector)
-        print(f"\nDONE. Created: {created} | Skipped: {skipped}")
-
-    run_captured(job, log)
-
-
-def _fix_qc_rotation(qcs, log):
-    """Non-static models are written in compiled space; the SMDs are rotated for CS2."""
-    for qc in qcs:
-        try:
-            with open(qc, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError:
-            continue
-        if re.search(r"^\s*\$staticprop\b", text, re.I | re.M):
-            continue
-        if "Decompiled by CS2 Porter" in text:
-            continue            # models we decompiled ourselves already face the right way
-        names = re.findall(r'studio\s+"([^"]+\.smd)"', text, re.I)
-        names += re.findall(r'\$(?:body|model)\s+"[^"]*"\s+"([^"]+\.smd)"', text, re.I)
-        names += re.findall(r'\$collision(?:model|joints)\s+"([^"]+\.smd)"', text, re.I)
-        for n in dict.fromkeys(names):
-            p = os.path.join(os.path.dirname(qc), n)
-            if os.path.isfile(p):
-                mdlmod.rotate_smd_file(p, p)
-
-
-def run_mdl(inp, out, opts, log, result=None):
-    rec = opts.get("recursive", True)
-    files = list_files(inp, (".mdl",), rec)
-    log(t("tl_found", n=len(files)), "info")
-    ok = fail = 0
-    for f in files:
-        folder = os.path.dirname(f)
-        dest = _mirror(folder, inp, out) if out else folder
-
-        def read(rel, folder=folder):
-            p = os.path.join(folder, os.path.basename(rel))
-            if os.path.isfile(p):
-                with open(p, "rb") as fh:
-                    return fh.read()
-            return None
-
-        rel = os.path.basename(f)
-        try:
-            r = mdlmod.decompile(read, rel, dest)
-            ok += 1
-            log(t("tl_mdl_line", f=os.path.relpath(f, inp), tris=r.triangles,
-                  phys=t("tl_phys") if r.physics else ""), "ok")
-            if result is not None:
-                result("model", os.path.relpath(f, inp), "created",
-                       t("tl_mdl_detail", tris=r.triangles, phys=t("tl_phys") if r.physics else ""), f)
-        except Exception as e:  # noqa: BLE001
-            fail += 1
-            log(t("tl_error", f=os.path.relpath(f, inp), e=e), "err")
-            if result is not None:
-                result("model", os.path.relpath(f, inp), "error", str(e), f)
-    log(t("tl_result", ok=ok, skip=0, fail=fail), "ok" if not fail else "warn")
-
-
-# ---------------------------------------------------------------------------
-# Converter: one tool for every Source 1 -> CS2 conversion of a folder
-# ---------------------------------------------------------------------------
-
-CONVERT_MODES = ("vmt_vmat", "mdl_vmdl", "qc_vmdl", "mdl_qc", "tex_vmat")
-
 
 def _game_root(inp, top):
     """Folder that holds top/ (materials or models) when the input is in one or has one."""
@@ -329,7 +271,7 @@ def _count_line(log, counts):
     log(t("tl_convert_done", parts=parts), "ok" if not counts.get("error") and not counts.get("missing") else "warn")
 
 
-def run_vmt_vmat(inp, out, opts, log, cfg=None, cancel=None, result=None):
+def run_vmt_vmat(inp, out, opts, log, cfg=None, cancel=None, status=None, result=None):
     """VMT files (with their VTF textures) -> .vmat, the same way as in a map port: the VMT
     is read, its textures are found (in the folder, the resource folders or the games) and
     turned into TGA files, and the material is written with the matching CS2 shader."""
@@ -337,7 +279,7 @@ def run_vmt_vmat(inp, out, opts, log, cfg=None, cancel=None, result=None):
     from .materials import MaterialConverter
     from .sources import CS2Index
     root = _game_root(inp, "materials")
-    vmts = list_files(inp, (".vmt",), opts.get("recursive", True))
+    vmts = _inputs(inp, (".vmt",), opts)
     log(t("tl_found", n=len(vmts)), "info")
     if not vmts:
         return
@@ -352,6 +294,7 @@ def run_vmt_vmat(inp, out, opts, log, cfg=None, cancel=None, result=None):
                 break
             r = conv.convert(rel[:-4])
             counts[r.status] = counts.get(r.status, 0) + 1
+            _report(status, f, r.status, r.detail)
             if result is not None:
                 result("material", r.mat, r.status, r.detail, r.source)
             tag = {"created": "ok", "missing": "warn", "error": "err", "unsupported": "warn"}.get(r.status, "dim")
@@ -361,7 +304,7 @@ def run_vmt_vmat(inp, out, opts, log, cfg=None, cancel=None, result=None):
         sources.close()
 
 
-def run_mdl_vmdl(inp, out, opts, log, cfg=None, cancel=None, result=None):
+def run_mdl_vmdl(inp, out, opts, log, cfg=None, cancel=None, status=None, result=None):
     """Compiled models (.mdl + .vvd + .vtx + .phy) -> decompiled to QC / SMD, then .vmdl, with
     the model's materials (the same way as in a map port)."""
     import tempfile
@@ -370,7 +313,7 @@ def run_mdl_vmdl(inp, out, opts, log, cfg=None, cancel=None, result=None):
     from .models import ModelConverter, QCIndex
     from .sources import CS2Index
     root = _game_root(inp, "models")
-    mdls = list_files(inp, (".mdl",), opts.get("recursive", True))
+    mdls = _inputs(inp, (".mdl",), opts)
     log(t("tl_found", n=len(mdls)), "info")
     if not mdls:
         return
@@ -390,6 +333,7 @@ def run_mdl_vmdl(inp, out, opts, log, cfg=None, cancel=None, result=None):
                 break
             r = modelconv.convert("models/" + rel)
             counts[r.status] = counts.get(r.status, 0) + 1
+            _report(status, f, r.status, r.detail)
             if result is not None:
                 result("model", r.mdl, r.status, r.detail, r.source)
             tag = {"created": "ok", "missing": "warn", "error": "err"}.get(r.status, "dim")
@@ -408,58 +352,51 @@ def run_mdl_vmdl(inp, out, opts, log, cfg=None, cancel=None, result=None):
                 log(f"    [{_status(r.status)}] {m}  {r.detail}", "warn")
         if mats:
             log(t("tl_model_mats", n=made, total=len(mats)), "info")
+        modelconv.fix_mesh_materials()
         _count_line(log, counts)
     finally:
         sources.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_convert(inp, out, opts, log, cfg=None, cancel=None, result=None):
-    """result: called with (kind, name, status, detail, source) for every converted file."""
-    mode = opts.get("mode", "vmt_vmat")
-    if mode == "vmt_vmat":
-        return run_vmt_vmat(inp, out, opts, log, cfg, cancel, result)
-    if mode == "mdl_vmdl":
-        return run_mdl_vmdl(inp, out, opts, log, cfg, cancel, result)
-    if mode == "qc_vmdl":
-        return run_vmdl(inp, out, opts, log)
-    if mode == "mdl_qc":
-        return run_mdl(inp, out, opts, log, result)
-    return run_vmat(inp, out, opts, log)
+def _flat_target(f, out, ext):
+    """Output file of a list item: its name (with the new extension) in the output folder."""
+    return os.path.join(out, os.path.splitext(os.path.basename(f))[0] + ext)
 
 
-def run_trans(inp, out, opts, log):
-    rec = opts.get("recursive", False)
+def run_trans(items, out, opts, log, cfg=None, cancel=None, status=None):
     overwrite = opts.get("overwrite", False)
-    files = [f for f in list_files(inp, (".png", ".tga"), rec)
-             if not os.path.splitext(f)[0].lower().endswith("_transculent")]
-    log(t("tl_found", n=len(files)), "info")
     ok = skip = fail = 0
-    for f in files:
-        base, ext = os.path.splitext(f)
-        dst = (_mirror(base, inp, out) if out else base) + "_transculent" + ext
+    for it in items:
+        if cancel is not None and cancel.is_set():
+            break
+        f = it["files"][0]
+        base, ext = os.path.splitext(os.path.basename(f))
+        dst = os.path.join(out, base + "_transculent" + ext)
         if os.path.isfile(dst) and not overwrite:
             skip += 1
+            _report(status, it["id"], "exists", t("m_in_folder"))
             continue
         try:
             img = Image.open(f)
-            if img.mode not in ("RGBA", "LA", "PA") and "transparency" not in img.info:
+            alpha = None
+            if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+                alpha = np.asarray(img.convert("RGBA").getchannel("A"))
+            if alpha is None or alpha.min() == 255:
                 skip += 1
-                log(t("tl_mask_skip", f=os.path.relpath(f, inp)), "dim")
-                continue
-            alpha = np.asarray(img.convert("RGBA").getchannel("A"))
-            if alpha.min() == 255:
-                skip += 1
-                log(t("tl_mask_skip", f=os.path.relpath(f, inp)), "dim")
+                log(t("tl_mask_skip", f=it["name"]), "dim")
+                _report(status, it["id"], "skip", t("tl_no_alpha"))
                 continue
             mask = Image.fromarray(np.stack([alpha] * 3, axis=2), "RGB")
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.makedirs(out, exist_ok=True)
             mask.save(dst)
             ok += 1
-            log(f"  OK  {os.path.relpath(dst, out or inp)}", "info")
+            log(f"  OK  {os.path.basename(dst)}", "info")
+            _report(status, it["id"], "created", os.path.basename(dst))
         except Exception as e:  # noqa: BLE001
             fail += 1
-            log(t("tl_error", f=os.path.relpath(f, inp), e=e), "err")
+            log(t("tl_error", f=it["name"], e=e), "err")
+            _report(status, it["id"], "error", str(e))
     log(t("tl_result", ok=ok, skip=skip, fail=fail), "ok" if not fail else "warn")
 
 
@@ -468,9 +405,7 @@ def _open_image(path):
         with open(path, "rb") as f:
             from . import config
             return vtfmod.image_from_bytes(f.read(), ".vtf", config.VTFCMD)
-    img = Image.open(path)
-    img.load()
-    return img
+    return texnames.open_image(path)
 
 
 def _save_image(img, path, fmt):
@@ -496,53 +431,53 @@ def _save_image(img, path, fmt):
         img.save(path, "TIFF", compression="tiff_lzw")
 
 
-def run_image(inp, out, opts, log):
-    rec = opts.get("recursive", False)
+def run_image(items, out, opts, log, cfg=None, cancel=None, status=None):
     overwrite = opts.get("overwrite", False)
-    src = opts.get("from", "TGA")
     dst = opts.get("to", "PNG")
-    exts = sum(IMAGE_IN.values(), ()) if src == "ALL" else IMAGE_IN.get(src, (".tga",))
     new_ext = _OUT_EXT[dst]
-    files = [f for f in list_files(inp, exts, rec) if not f.lower().endswith(IMAGE_IN.get(dst, (new_ext,)))]
-    log(t("tl_found", n=len(files)), "info")
     ok = skip = fail = 0
-    for f in files:
-        target = os.path.splitext(_mirror(f, inp, out) if out else f)[0] + new_ext
+    for it in items:
+        if cancel is not None and cancel.is_set():
+            break
+        f = it["files"][0]
+        if f.lower().endswith(IMAGE_IN.get(dst, (new_ext,))):
+            skip += 1
+            _report(status, it["id"], "skip", t("tl_same_format"))
+            continue
+        target = _flat_target(f, out, new_ext)
         if os.path.isfile(target) and not overwrite:
             skip += 1
+            _report(status, it["id"], "exists", t("m_in_folder"))
             continue
         try:
             _save_image(_open_image(f), target, dst)
             ok += 1
-            log(f"  OK  {os.path.relpath(target, out or inp)}", "info")
+            log(f"  OK  {os.path.basename(target)}", "info")
+            _report(status, it["id"], "created", os.path.basename(target))
         except Exception as e:  # noqa: BLE001
             fail += 1
-            log(t("tl_error", f=os.path.relpath(f, inp), e=e), "err")
+            log(t("tl_error", f=it["name"], e=e), "err")
+            _report(status, it["id"], "error", str(e))
     log(t("tl_result", ok=ok, skip=skip, fail=fail), "ok" if not fail else "warn")
 
 
 _SKY_FACE_RE = re.compile(r"^(.+?)_?(up|dn|lf|rt|ft|bk)$", re.I)
 
 
-def run_skybox(inp, out, opts, log):
+def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
     """Six skybox faces (<name>up / dn / lf / rt / ft / bk, any image format) -> a CS2 cube
     cross (skybox.png) with skybox.vmat and skybox_moondome.vmat, one folder per sky."""
     from . import skybox as skymod
-    files = list_files(inp, sum(IMAGE_IN.values(), ()), opts.get("recursive", False))
-    skies = {}
-    for f in files:
-        m = _SKY_FACE_RE.match(os.path.splitext(os.path.basename(f))[0])
-        if m:
-            key = (os.path.dirname(f), m.group(1).rstrip("_"))
-            skies.setdefault(key, {}).setdefault(m.group(2).lower(), f)
-    skies = {k: v for k, v in skies.items() if sum(1 for s in skymod.SIDES if s in v) >= 4}
-    log(t("tl_sky_found", n=len(skies)), "info")
     ok = skip = fail = 0
-    for (folder, name), faces in sorted(skies.items()):
-        dst = os.path.join(out or folder, name)
+    for it in items:
+        if cancel is not None and cancel.is_set():
+            break
+        name, faces = it["name"], it["faces"]
+        dst = os.path.join(out, name)
         png = os.path.join(dst, "skybox.png")
         if os.path.isfile(png) and not opts.get("overwrite", False):
             skip += 1
+            _report(status, it["id"], "exists", t("m_in_folder"))
             continue
         try:
             imgs = {face: _open_image(p).convert("RGB") for face, p in faces.items()}
@@ -554,49 +489,290 @@ def run_skybox(inp, out, opts, log):
             with open(os.path.join(dst, "skybox_moondome.vmat"), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(skymod.MOONDOME_TEMPLATE % {"png": skymod.SKY_PNG})
             ok += 1
-            log(f"  OK  {os.path.relpath(dst, out or inp)}  "
-                + t("sk_fit", order=" ".join(ring), up=up_rot * 90, dn=dn_rot * 90).strip(), "info")
+            fit = t("sk_fit", order=" ".join(ring), up=up_rot * 90, dn=dn_rot * 90).strip()
+            log(f"  OK  {name}  {fit}", "info")
+            _report(status, it["id"], "created", name)
         except Exception as e:  # noqa: BLE001
             fail += 1
             log(t("tl_error", f=name, e=e), "err")
+            _report(status, it["id"], "error", str(e))
     log(t("tl_result", ok=ok, skip=skip, fail=fail), "ok" if not fail else "warn")
 
 
-def run_fbx(inp, out, opts, log):
-    run_captured(lambda: fbx_converter.main(inp, out or None), log)
+def _fbx_runner(kind):
+    def run(items, out, opts, log, cfg=None, cancel=None, status=None):
+        """Polyhaven / Megascans models (FBX with their textures) -> .vmdl and .vmat. Every row
+        has its own collision: none, a convex hull or the exact shape of the model."""
+        def job():
+            ok = fail = 0
+            print(f"  Models to process: {len(items)}")
+            for it in items:
+                if cancel is not None and cancel.is_set():
+                    break
+                on = it.get("on", {})
+                asset = kind + ("_basic" if on.get("convex", True) else "_complex") if on.get("collision") else kind
+                try:
+                    done = fbx_converter.process_group(it["key"], it["files"], out, "", None, out, asset_type=asset)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ERROR   {it['name']}: {e}")
+                    done = False
+                ok += bool(done)
+                fail += not done
+                _report(status, it["id"], "created" if done else "error")
+            print(f"\nDONE  OK: {ok}   Failed: {fail}")
+        run_captured(job, log)
+    return run
 
 
-def run_decal(inp, out, opts, log):
-    run_captured(lambda: jpg_converter.main(inp, out or None), log)
+def run_textures(items, out, opts, log, cfg=None, cancel=None, status=None):
+    """Polyhaven / Megascans textures (color, normal, AO ... of one surface) -> one .vmat each,
+    as a texture or as a decal."""
+    def job():
+        ok = fail = 0
+        for it in items:
+            if cancel is not None and cancel.is_set():
+                break
+            category = "decals" if it.get("on", {}).get("decal") else "textures"
+            try:
+                done = jpg_converter.process_group(it["name"], it["files"], category, out)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ERROR   {it['name']}: {e}")
+                done = False
+            ok += bool(done)
+            fail += not done
+            _report(status, it["id"], "created" if done else "error")
+        print(f"\nDONE  OK: {ok}   Failed: {fail}")
+    run_captured(job, log)
 
 
-def reset_fbx_folders(path, log):
-    run_captured(lambda: reset_folders.clear_target_folders(reset_folders.TARGET_LIST, path), log)
+# ---------------------------------------------------------------------------
+# List rows: what the user adds becomes the rows a tool converts
+# ---------------------------------------------------------------------------
+# a row: {"id", "name", "path" (shown), "files" (real paths), "detail", "on" (the row's switches),
+# "children" (the files the row also uses: [{"name", "detail", "path"}], shown below it)
+
+def _child(path, detail="", name=None):
+    return {"name": name or os.path.basename(path), "detail": detail, "path": path}
 
 
-def fbx_reset_targets(path):
-    return [f for _p, f in reset_folders.find_existing(reset_folders.TARGET_LIST, path)]
+_VMT_KEY_RE = re.compile(r'^\s*"?(\$?[\w%]+)"?\s+"?([^"\r\n{}]+?)"?\s*(?://.*)?$')
+_VMT_TEX_ENDS = ("texture", "texture2", "map", "map2", "mask", "mask2", "detail", "detail2", "iris")
+
+
+def _vmt_children(f):
+    """The textures (and the material it includes) a .vmt names."""
+    try:
+        with open(f, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    root = _game_root(os.path.dirname(f), "materials")
+    out, seen = [], set()
+    for line in lines:
+        m = _VMT_KEY_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip().replace("\\", "/")
+        if key == "include":
+            ext, rel = "", val[len("materials/"):] if val.lower().startswith("materials/") else val
+        elif key.startswith("$") and key.endswith(_VMT_TEX_ENDS) and key != "$envmap":
+            ext, rel = ".vtf", val
+        else:
+            continue
+        low = rel.lower()
+        if not rel or low.startswith(("_rt_", "env_cubemap", "[")) or re.fullmatch(r"[-\d. ]+", rel) or low in seen:
+            continue
+        seen.add(low)
+        name = rel if low.endswith((".vtf", ".vmt")) else rel + ext
+        cands = [os.path.join(root, "materials", name)] if root else []
+        cands.append(os.path.join(os.path.dirname(f), os.path.basename(name)))
+        path = next((p for p in cands if os.path.isfile(p)), "")
+        out.append({"name": name, "detail": key.lstrip("$"), "path": path})
+    return out
+
+
+_MDL_PARTS = (".vvd", ".dx90.vtx", ".dx80.vtx", ".sw.vtx", ".vtx", ".phy", ".ani")
+
+
+def _mdl_children(f):
+    """The files that come with a .mdl (.vvd, .vtx, .phy) and the materials it uses."""
+    stem = f[:-4]
+    out = [_child(stem + ext) for ext in _MDL_PARTS if os.path.isfile(stem + ext)]
+    try:
+        with open(f, "rb") as fh:
+            m = mdlmod.MDL(fh.read())
+    except Exception:  # noqa: BLE001
+        return out
+    root = _game_root(os.path.dirname(f), "models")
+    seen = set()
+    for tex in m.textures:
+        cds = [cd.replace("\\", "/").strip("/") for cd in m.cdmaterials] or [""]
+        names = [(cd + "/" if cd else "") + tex.replace("\\", "/") + ".vmt" for cd in cds]
+        path = ""
+        if root:
+            path = next((p for p in (os.path.join(root, "materials", n) for n in names) if os.path.isfile(p)), "")
+        name = names[0].lower() if not path else os.path.relpath(path, os.path.join(root, "materials")).replace("\\", "/")
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            out.append({"name": name, "detail": t("fl_child_material"), "path": path})
+    return out
+
+
+def _file_rows(pairs, keep=None, children=None):
+    rows = []
+    for f, shown in pairs:
+        if keep is not None and not keep(f):
+            continue
+        rows.append({"id": file_key(f), "name": os.path.basename(f), "path": shown, "files": [f], "detail": "",
+                     "children": children(f) if children else []})
+    return rows
+
+
+_SKY_ORDER = ("up", "dn", "lf", "rt", "ft", "bk")
+
+
+def _sky_rows(pairs):
+    skies = {}
+    for f, shown in pairs:
+        m = _SKY_FACE_RE.match(os.path.splitext(os.path.basename(f))[0])
+        if m:
+            key = (os.path.dirname(f), m.group(1).rstrip("_"))
+            sky = skies.setdefault(key, {"shown": os.path.dirname(shown), "faces": {}})
+            sky["faces"].setdefault(m.group(2).lower(), f)
+    rows = []
+    from . import skybox as skymod
+    for (folder, name), sky in sorted(skies.items()):
+        faces = sky["faces"]
+        if sum(1 for s in skymod.SIDES if s in faces) < 4:
+            continue
+        rows.append({"id": file_key(os.path.join(folder, name)), "name": name, "path": sky["shown"],
+                     "files": list(faces.values()), "faces": faces,
+                     "detail": " ".join(s for s in _SKY_ORDER if s in faces),
+                     "children": [_child(faces[s], s) for s in _SKY_ORDER if s in faces]})
+    return rows
+
+
+_SLOT_NAMES = {"color": "Color", "normal": "Normal", "ao": "AO", "translucency": "Opacity",
+               "roughness": "Roughness"}
+_FBX_SLOTS = {"TextureLayer1Color": "color", "TextureLayer1Normal": "normal", "TextureLayer1Roughness": "roughness",
+              "TextureLayer1AmbientOcclusion": "ao", "TextureLayer1Translucency": "translucency"}
+
+
+def _fbx_textures(fbx):
+    """The textures a model gets (the same folder, or its textures/ folder)."""
+    folder = os.path.dirname(fbx)
+    texs = fbx_converter.find_textures_in_dir(folder)
+    if not texs and os.path.isdir(os.path.join(folder, "textures")):
+        texs = fbx_converter.find_textures_in_dir(os.path.join(folder, "textures"))
+    used = fbx_converter.select_textures_for_slots(texs) if texs else {}
+    return [_child(p, _SLOT_NAMES.get(_FBX_SLOTS.get(slot, ""), "")) for slot, p in
+            sorted(used.items(), key=lambda kv: list(_FBX_SLOTS).index(kv[0]) if kv[0] in _FBX_SLOTS else 9)]
+
+
+def _fbx_rows(pairs, defaults):
+    shown_of = {f: s for f, s in pairs}
+    rows = []
+    for key, files in sorted(fbx_converter.group_fbx_files([f for f, _s in pairs]).items()):
+        name = os.path.basename(key)
+        with contextlib.redirect_stdout(None):
+            texs = _fbx_textures(files[0])
+        kids = [_child(f, t("fl_child_model") + (f" (LOD {i})" if len(files) > 1 else ""))
+                for i, f in enumerate(files)] + texs
+        rows.append({"id": file_key(key), "key": key, "name": name,
+                     "path": os.path.dirname(shown_of[files[0]]), "files": files,
+                     "detail": t("tl_lods", n=len(files)) if len(files) > 1 else "", "on": dict(defaults),
+                     "children": kids})
+    return rows
+
+
+def _texture_rows(pairs):
+    by_dir = {}
+    for f, shown in pairs:
+        if jpg_converter.classify_texture(f):
+            by_dir.setdefault(os.path.dirname(f), []).append((f, shown))
+    rows = []
+    for folder, group in sorted(by_dir.items()):
+        shown_of = dict(group)
+        for gname, files in sorted(jpg_converter.group_textures([f for f, _s in group]).items()):
+            safe = re.sub(r"[^\w\-]", "_", gname).lower()
+            # roughness maps are not used by the material
+            slots = texnames.pick_slots(files, ("color", "normal", "ao", "translucency"))
+            if "color" not in slots and "normal" not in slots:
+                continue
+            decal = "decal" in folder.lower().replace("\\", "/").split("/")[-1]
+            order = [s for s in _SLOT_NAMES if s in slots]
+            rows.append({"id": file_key(os.path.join(folder, safe)), "name": safe,
+                         "path": os.path.dirname(shown_of[files[0]]), "files": files,
+                         "detail": ", ".join(_SLOT_NAMES[s] for s in order),
+                         "on": {"decal": decal},
+                         "children": [_child(slots[s], _SLOT_NAMES[s]) for s in order]})
+    return rows
+
+
+_IMAGE_EXTS = sum(IMAGE_IN.values(), ())
+
+
+def items(td, paths, log=None):
+    """Rows of a tool's list for the dropped / picked paths."""
+    pairs = expand_paths(paths, td["exts"], log)
+    kind = td.get("rows", "files")
+    if kind == "sky":
+        return _sky_rows(pairs)
+    if kind == "fbx":
+        return _fbx_rows(pairs, {k: d for k, _label, d in td.get("switches", ())})
+    if kind == "textures":
+        return _texture_rows(pairs)
+    return _file_rows(pairs, td.get("keep"), td.get("children"))
+
+
+def run_tool(td, rows, out, opts, log, cfg=None, cancel=None, status=None):
+    """Converts the rows into the output folder. The converters that work like a map port take
+    the rows' files folder by folder: a file under a materials (models) folder keeps its game path."""
+    os.makedirs(out, exist_ok=True)
+    top = td.get("game_root")
+    if not top:
+        return td["run"](rows, out, opts, log, cfg=cfg, cancel=cancel, status=status)
+    groups = {}
+    for it in rows:
+        f = it["files"][0]
+        base = _game_root(os.path.dirname(f), top) or os.path.dirname(f)
+        groups.setdefault(base, []).append(f)
+    for base, files in groups.items():
+        if cancel is not None and cancel.is_set():
+            break
+        td["run"](base, out, dict(opts, files=files), log, cfg=cfg, cancel=cancel, status=status)
 
 
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
-# options: recursive (default), overwrite, formats, fix_rotation
+# exts: the files a tool takes; rows: how they are listed; options: overwrite, formats;
+# switches: (key, label, default) per row; game_root: converted folder by folder;
+# children: the files a row also uses; add: "folder" when only folders are added
 
 TOOLS = [
-    {"id": "convert", "group": "port", "name": "t_convert_name", "desc": "t_convert_desc",
-     "options": {"recursive": True, "overwrite": False, "fix_rotation": True, "modes": CONVERT_MODES},
-     "run": run_convert, "full": True},
-    {"id": "trans", "group": "port", "name": "t_trans_name", "desc": "t_trans_desc",
-     "options": {"recursive": False, "overwrite": False}, "run": run_trans},
-    {"id": "image", "group": "port", "name": "t_image_name", "desc": "t_image_desc",
-     "options": {"recursive": False, "overwrite": False, "formats": True}, "run": run_image},
-    {"id": "skybox", "group": "port", "name": "t_sky_name", "desc": "t_sky_desc", "hint": "t_sky_hint",
-     "options": {"recursive": False, "overwrite": False}, "run": run_skybox},
-    {"id": "fbx", "group": "assets", "name": "t_fbx_name", "desc": "t_fbx_desc", "hint": "t_fbx_hint",
-     "options": {}, "run": run_fbx, "reset": True},
-    {"id": "decal", "group": "assets", "name": "t_decal_name", "desc": "t_decal_desc",
-     "options": {}, "run": run_decal},
+    {"id": "vmt_vmat", "group": "port", "name": "t_vmt_name", "desc": "t_vmt_desc", "exts": (".vmt",),
+     "game_root": "materials", "children": _vmt_children, "options": {"overwrite": False}, "run": run_vmt_vmat},
+    {"id": "mdl_vmdl", "group": "port", "name": "t_mdl_name", "desc": "t_mdl_desc", "exts": (".mdl",),
+     "game_root": "models", "children": _mdl_children, "options": {"overwrite": False}, "run": run_mdl_vmdl},
+    {"id": "image", "group": "port", "name": "t_image_name", "desc": "t_image_desc", "exts": _IMAGE_EXTS,
+     "options": {"overwrite": False, "formats": True}, "run": run_image},
+    {"id": "trans", "group": "port", "name": "t_trans_name", "desc": "t_trans_desc", "exts": (".png", ".tga"),
+     "keep": lambda f: not os.path.splitext(f)[0].lower().endswith("_transculent"),
+     "options": {"overwrite": False}, "run": run_trans},
+    {"id": "skybox", "group": "port", "name": "t_sky_name", "desc": "t_sky_desc", "exts": _IMAGE_EXTS,
+     "rows": "sky", "add": "folder", "options": {"overwrite": False}, "run": run_skybox},
+    {"id": "fbx", "group": "assets", "name": "t_fbx_name", "desc": "t_fbx_desc", "exts": (".fbx",),
+     "rows": "fbx", "options": {}, "run": _fbx_runner("static"),
+     "switches": (("collision", "sw_collision", True), ("convex", "sw_convex", True)),
+     "requires": {"convex": "collision"}},
+    {"id": "foliage", "group": "assets", "name": "t_foliage_name", "desc": "t_foliage_desc", "exts": (".fbx",),
+     "rows": "fbx", "options": {}, "run": _fbx_runner("foliage"),
+     "switches": (("collision", "sw_collision", False), ("convex", "sw_convex", True)),
+     "requires": {"convex": "collision"}},
+    {"id": "textures", "group": "assets", "name": "t_tex_name", "desc": "t_tex_desc",
+     "exts": tuple(sorted(jpg_converter.TEXTURE_EXT)),
+     "rows": "textures", "options": {}, "run": run_textures, "switches": (("decal", "sw_decal", False),)},
 ]
 
 

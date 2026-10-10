@@ -376,6 +376,44 @@ class ModelConverter:
         self.convert_cs2_existing = convert_cs2_existing
         self.use_valve = valve is not None and valve.has_cs2_tools
         self.results = {}
+        self.written = {}       # vmdl path -> build_vmdl arguments
+        self.skins_used = {}    # mdl -> skins the map shows (None = any)
+
+    def _has_vmat_source(self, rel):
+        """True if a .vmat source file exists for rel (the compiler only looks at sources)."""
+        roots = [self.content_dir]
+        cs2 = getattr(self.index, "cs2_dir", "")
+        if cs2:
+            roots += [os.path.join(cs2, "content", "csgo"), os.path.join(cs2, "content", "core")]
+        return any(os.path.isfile(os.path.join(r, *rel.split("/"))) for r in roots)
+
+    def mesh_material(self, name):
+        """The material path the CS2 compiler gives a mesh whose SMD material is name.
+        A name with a folder becomes materials/<name>.vmat when that .vmat source exists,
+        else materials/<name>_color.vmat (a material that CS2 only has compiled)."""
+        base = re.sub(r"\.(vmt|vmat)$", "", name.replace("\\", "/").strip(), flags=re.IGNORECASE)
+        if "/" not in base:
+            return f"{name}.vmat"
+        base = base.lower().strip("/")
+        if self._has_vmat_source(f"materials/{base}.vmat") or base.endswith("_color"):
+            return f"materials/{base}.vmat"
+        return f"materials/{base}_color.vmat"
+
+    def _write_vmdl(self, vmdl_abs):
+        model_dir, render, physics, remaps, skin_groups, scale = self.written[vmdl_abs]
+        remaps = [(self.mesh_material(m), to) for m, to in remaps]
+        skin_groups = [[(self.mesh_material(a), to) for a, to in g] for g in skin_groups]
+        with open(vmdl_abs, "w", encoding="utf-8") as f:
+            f.write(build_vmdl(model_dir, render, physics, remaps, skin_groups, scale))
+
+    def fix_mesh_materials(self):
+        """Writes the created .vmdl files again once the materials are made, so each remap
+        names the material path the compiler really gives the mesh."""
+        for vmdl_abs in self.written:
+            try:
+                self._write_vmdl(vmdl_abs)
+            except OSError:
+                pass
 
     def convert(self, mdl):
         mdl = norm_model(mdl)
@@ -515,27 +553,31 @@ class ModelConverter:
             return chosen
 
         for m in smd_mats:
-            remaps.append((f"{m}.vmat", f"materials/{out_name(resolve(m))}.vmat"))
+            remaps.append((m, f"materials/{out_name(resolve(m))}.vmat"))
         if not remaps:
             name = os.path.splitext(os.path.basename(mdl))[0]
-            remaps.append((f"{name}.vmat", f"materials/{out_name(resolve(name))}.vmat"))
+            remaps.append((name, f"materials/{out_name(resolve(name))}.vmat"))
 
         skin_groups = []
         if len(q.skins) > 1:
+            # skins the map never shows keep their place but get no materials of their own
+            used = self.skins_used.get(mdl, None) if mdl in self.skins_used else None
+            last = len(q.skins) - 1 if used is None else min(len(q.skins) - 1, max(used, default=0))
             base_row = q.skins[0]
-            for row in q.skins[1:]:
+            for i, row in enumerate(q.skins[1:last + 1], start=1):
                 group = []
-                for a, b in zip(base_row, row):
-                    if a.lower() == b.lower():
-                        continue
-                    group.append((f"{a}.vmat", f"materials/{out_name(resolve(b))}.vmat"))
-                if group:
-                    skin_groups.append(group)
+                if used is None or i in used:
+                    for a, b in zip(base_row, row):
+                        if a.lower() == b.lower():
+                            continue
+                        group.append((a, f"materials/{out_name(resolve(b))}.vmat"))
+                skin_groups.append(group)
+            while skin_groups and not skin_groups[-1]:
+                skin_groups.pop()
 
-        content = build_vmdl(model_dir, render, physics, remaps, skin_groups, q.scale)
         vmdl_abs = os.path.join(self.content_dir, *(out_name(mdl[:-4]) + ".vmdl").split("/"))
-        with open(vmdl_abs, "w", encoding="utf-8") as f:
-            f.write(content)
+        self.written[vmdl_abs] = (model_dir, render, physics, remaps, skin_groups, q.scale)
+        self._write_vmdl(vmdl_abs)
         if label is None:
             label = next((s.label for s in self.sources.resource_sources()
                           if os.path.normcase(qc_path).startswith(os.path.normcase(getattr(s, "root", "")))),

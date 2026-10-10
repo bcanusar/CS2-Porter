@@ -53,6 +53,20 @@ def _vtf_stub(w, h):
     return bytes(hdr) + bytes(max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 8)
 
 
+def _is_patch(data):
+    head = data[:200].decode("latin-1", "replace").lstrip("﻿ \t\r\n\"").lower()
+    return head.startswith("patch")
+
+
+def _flat_vmt(vmt):
+    lines = [f'"{vmt.shader}"', "{"]
+    for k, v in vmt.params.items():
+        if isinstance(v, str) and '"' not in v and '"' not in k:
+            lines.append(f'\t"{k}" "{v}"')
+    lines.append("}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def _texture_size(sources, tex):
     src, rel, ext = sources.find_texture(tex)
     if src is None:
@@ -109,11 +123,19 @@ def build_stub_game(work_dir, sources, materials, skyname="", aliases=None):
             rel = rel.replace("//", "/")
         data = loader(rel)
         if data is None:
-            continue
+            # a map that names a material "materials/<x>" packs it as materials/materials/<x>
+            data, _src = sources.read("materials/" + rel)
+            if data is None:
+                continue
         try:
             vmt = parse_vmt(data, rel, loader)
         except Exception:  # noqa: BLE001
             continue
+        if rel not in written_vmt or _is_patch(data):
+            # the importer does not follow "patch" includes (the texture size would be lost):
+            # it gets the VMT with the included values filled in
+            written_vmt.add(rel)
+            put(rel, _flat_vmt(vmt) if _is_patch(data) else data)
         for key in _TEX_KEYS:
             val = vmt.get(key)
             if not val:

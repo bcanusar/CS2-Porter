@@ -13,6 +13,29 @@ For each map it:
 
 The map itself is **not** compiled. You open the result in Hammer and compile it there.
 
+## Features
+
+A plain import of a map into CS2 brings over its brushes and entities and leaves the rest to
+you. CS2 Porter goes further:
+
+| Area | What CS2 Porter does |
+|---|---|
+| Many maps at once | A list of maps, each into its own addon or a shared one. Two maps are ported at a time and the next starts as soon as one ends. Maps can come as `.bsp`, `.vmf` or inside `.zip`, `.rar` and `.7z` archives. |
+| Finding assets | Looks for every material, model, sound and particle in the map's own packed files, in every installed Source 1 game (folders and VPKs) and in your own resource folders. Materials the map forgot to pack are taken from the copy the map compiler left inside the map. |
+| Models | Its own model decompiler turns `.mdl` files into CS2 models with their physics, skins and correct orientation; animated models keep their animations. |
+| Materials | Translucency, alpha test, self illumination, additive glow, scrolling and animated textures (turned into sprite sheets), blend materials, water and refracting glass are converted to their CS2 shaders. Texture scales on brushes are corrected. |
+| Lighting | Light brightness is measured against the Source 1 falloff and matched in lumens, the sun and sky keep their strength, and materials that gave light in Source 1 (texture lights) glow and light the map again. Light probe volumes are added for the whole map. |
+| Displacements | Blend displacements keep their texture blending. |
+| Effects | The map's particle systems are converted, and sprites, beams, spotlights, dust, smoke, embers and fire become CS2 particle effects. Ropes become cables that sag like they did in Source 1. |
+| Sky | 2D skyboxes and skies drawn from cube textures become a CS2 sky, with sky brushes that show it. |
+| Post processing | The map's color correction becomes CS2 post processing, and water gets an underwater look that follows the shape of the water. |
+| Sound | Ambient sounds and soundscapes become CS2 sound events with the same range and fade. |
+| Map fixes | Decals are put back onto their surfaces, clip brushes are rebuilt from the `.bsp`, entities CS2 does not have are converted or removed, and unknown keys are cleaned up. |
+| Missing assets | Lists what a ported map (and the models in its addon) still misses, searches for it in your games and adds it to the addon. A model whose material exists nowhere can get a placeholder material, so it still compiles. |
+| Tools | Converters for single files and folders: materials, models, images, translucency masks, skyboxes, and Polyhaven / Megascans models, plants and textures. |
+| Report | Every port writes a full `report.txt`: each step, every file and where it came from, and what could not be found. |
+| Comfort | English, Turkish, Russian and Chinese, dark and light theme, drag and drop everywhere, and updates from inside the program. |
+
 ## Requirements
 
 - Windows 10 or 11 (64 bit).
@@ -38,16 +61,21 @@ Windows SmartScreen may warn about the program because it is not signed. Click
 
 ## Using it
 
-1. **Port Map** tab: add one or more `.bsp` files.
+1. **Port Map** tab: add one or more `.bsp` files, or drag them (or a folder or archive) onto
+   the list.
 2. Select a map and pick the addon it goes into, or type a new addon name.
-3. Press **Port**. Finished maps turn green.
-4. Open the addon in Hammer (CS2 Workshop Tools), open the map and compile it.
+3. Check **Port settings** if you want to change how the maps are ported.
+4. Press **Port**. Finished maps turn green.
+5. Open the addon in Hammer (CS2 Workshop Tools), open the map and compile it.
 
 Other tabs:
 
-- **Missing Assets**: lists what a ported map still misses, and finds a file in your games, in
-  CS2 or in a `.bsp`.
-- **Tools**: converts single files or folders (VMT to VMAT, MDL to VMDL and more).
+- **Missing Assets**: lists what a ported map still misses, finds it in your games and adds it
+  to the addon.
+- **Search Files**: finds any file by its name in your games, in CS2 or in a `.bsp`, and exports
+  it with the files it needs.
+- **Tools**: converts single files or folders (materials, models, images, skyboxes, Polyhaven and
+  Megascans assets).
 - **Settings**: language, theme, the CS2 folder, extra folders with Source 1 files, and the
   port options.
 

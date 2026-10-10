@@ -64,25 +64,34 @@ DEFAULTS = {
     "maximized": False,
     "cs2_dir": "",
     "last_bsp_dir": "",
-    "last_tool": "convert",
+    "last_tool": "vmt_vmat",
+    "last_tool_dir": "",
     "last_export_dir": "",
     "tool_paths": {},
     # folders with Source 1 files (materials/, models/ ...) searched before the installed games
     "resource_dirs": [],
     # an update the user chose to skip (its tag)
     "skip_update": "",
+    # the user set the bhop blocks option (before that bhop_ maps get it on their own)
+    "bhop_blocks_user": False,
+    "find_mode": "contains",
+    "miss_addon": "",
     "opts": {
         "overwrite": False,
         "convert_cs2_existing": False,
         "fix_light_brightness": True,
         "bhop_script": True,
         "bhop_download": True,
-        "bhop_blocks": True,
+        "bhop_blocks": False,
         "compile_assets": True,
         "split_triggers": True,
         "light_probes": True,
         "port_particles": True,
         "post_processing": True,
+        # sky brushes get skybox_moondome.vmat (off: they stay tools/toolsskybox.vmat)
+        "sky_moondome": True,
+        # a model material found nowhere is replaced by a CS2 material, so the model compiles
+        "model_placeholder": True,
     },
     # the map list of the Port Map tab: [[map path, addon name], ...]
 }
@@ -188,9 +197,11 @@ def load():
 
 def save(cfg):
     data = {k: cfg.get(k, v) for k, v in DEFAULTS.items()}
+    tmp = SETTINGS_FILE + ".tmp"
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SETTINGS_FILE)
     except OSError:
         pass
 

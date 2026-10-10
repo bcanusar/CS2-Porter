@@ -266,15 +266,16 @@ def compose(faces, ring, up_rot, dn_rot, size=FACE_SIZE):
     return cube
 
 
-def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, log=None):
-    """Writes skybox.png, skybox.vmat and skybox_moondome.vmat. Returns (status, detail)."""
+def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, log=None, moondome=True):
+    """Writes skybox.png, skybox.vmat and (moondome) skybox_moondome.vmat. Returns (status, detail)."""
     log = log or (lambda m, tag="info": None)
     sky = skyname.strip().lower()
     if not sky:
         return "skip", t("sk_no_sky")
     out_dir = os.path.join(content_dir, "materials", "skybox")
     vmats = [os.path.join(content_dir, *p.split("/")) for p in (SKY_VMAT, MOONDOME_VMAT, SKY_PNG)]
-    if not overwrite and all(os.path.isfile(p) for p in vmats):
+    needed = vmats if moondome else (vmats[0], vmats[2])
+    if not overwrite and all(os.path.isfile(p) for p in needed):
         return "exists", t("m_exists")
 
     faces = {}
@@ -292,8 +293,9 @@ def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, lo
     compose(faces, ring, up_rot, dn_rot).save(os.path.join(content_dir, *SKY_PNG.split("/")), "PNG")
     with open(vmats[0], "w", encoding="utf-8", newline="\n") as fh:
         fh.write(SKY_TEMPLATE % {"png": SKY_PNG})
-    with open(vmats[1], "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(MOONDOME_TEMPLATE % {"png": SKY_PNG})
+    if moondome:
+        with open(vmats[1], "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(MOONDOME_TEMPLATE % {"png": SKY_PNG})
     missing = [f for f in FACES if f not in faces]
     detail = t("sk_faces", n=len(faces)) + (t("sk_missing_faces", list=", ".join(missing)) if missing else "")
     return "created", detail

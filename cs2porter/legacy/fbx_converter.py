@@ -1,8 +1,7 @@
+import hashlib
 import os
 import re
-import random
 import shutil
-import string
 import struct
 import sys
 import zipfile
@@ -13,8 +12,12 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
-ASSETS_SUBFOLDER   = "assets"
-TEXTURE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tga", ".bmp", ".psd", ".exr", ".hdr"}
+from . import texnames
+
+# CS2 Porter: the converted assets go to models/cs2porter/assets and materials/cs2porter/assets
+ASSETS_SUBFOLDER   = "cs2porter/assets"
+_ASSETS_DIR        = os.path.join(*ASSETS_SUBFOLDER.split("/"))
+TEXTURE_EXTENSIONS = set(texnames.TEXTURE_EXTS)
 MAX_PATH           = 260
 
 # Windows absolute path prefix consumed before our game-relative path begins.
@@ -33,9 +36,17 @@ MAX_GAME_PATH = MAX_PATH - _WIN_PREFIX_BUDGET - 20   # ~100 chars
 _GAME_PATH_OVERHEAD = len(f"materials/{ASSETS_SUBFOLDER}/") + 1 + 50
 
 
-def _random_suffix(n: int = 4) -> str:
-    """Return n random lowercase letters."""
-    return "".join(random.choices(string.ascii_lowercase, k=n))
+def _random_suffix(name: str, n: int = 4) -> str:
+    """A short suffix made from the name: the same name is always shortened the same way."""
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:n]
+
+
+def set_out_root(root: str):
+    """CS2 Porter: the game path budget follows the real output folder when it is longer than
+    the usual addon folder."""
+    global MAX_GAME_PATH
+    used = max(len(os.path.abspath(root)) + 1, _WIN_PREFIX_BUDGET) if root else _WIN_PREFIX_BUDGET
+    MAX_GAME_PATH = MAX_PATH - used - 20
 
 
 def shorten_group_name(group_name: str) -> str:
@@ -53,7 +64,7 @@ def shorten_group_name(group_name: str) -> str:
     keep = max_group_len - 5
     if keep < 4:
         keep = 4
-    suffix = _random_suffix(4)
+    suffix = _random_suffix(group_name, 4)
     short = group_name[:keep] + "_" + suffix
     _warn(f"Folder name too long, shortened: '{group_name}' -> '{short}'")
     return short
@@ -109,6 +120,8 @@ def _extract_fbx_names_ascii(data: bytes, node_type: str) -> list[str]:
     seen, result = set(), []
     for m in raw:
         name = m.split("\x00")[0].strip()
+        # ASCII FBX names carry their class: "Material::bark"
+        name = name.split("::", 1)[1].strip() if "::" in name else name
         if name and name not in seen:
             seen.add(name)
             result.append(name)
@@ -241,6 +254,9 @@ def extract_fbx_materials(fbx_path: str) -> list[str]:
 def derive_material_name_from_textures(textures: list[str], fbx_stem: str) -> str:
     if not textures:
         return fbx_stem.lower()
+    named = texnames.group_name(textures)
+    if named:
+        return named
 
     known_suffixes = []
     for suffixes, _, _ in TEXTURE_SLOTS:
@@ -312,15 +328,19 @@ def calc_lod_thresholds(n: int) -> list[float]:
 # Texture classification & slot selection
 # ---------------------------------------------------------------------------
 
+_SLOT_KEYS = {"color": "TextureLayer1Color", "normal": "TextureLayer1Normal",
+              "roughness": "TextureLayer1Roughness", "ao": "TextureLayer1AmbientOcclusion",
+              "translucency": "TextureLayer1Translucency"}
+
+
 def _classify_texture(tex_path: str) -> tuple[str, int, int] | None:
-    base = os.path.splitext(os.path.basename(tex_path))[0].lower()
-    for suffixes, slot, tier in TEXTURE_SLOTS:
-        if slot in EXCLUDED_SLOTS:
-            continue
-        for suf in suffixes:
-            if base.endswith(suf):
-                return slot, tier, len(suf)
-    return None
+    # CS2 Porter: the names are read by texnames (Polyhaven "_diff_1k", Megascans "_4K_Albedo" ...);
+    # the third value sorts the maps of one slot (OpenGL normal maps and plain images first)
+    info = texnames.parse(tex_path)
+    if info is None or info["slot"] not in _SLOT_KEYS:
+        return None
+    r = texnames.rank(tex_path)
+    return _SLOT_KEYS[info["slot"]], info["tier"], -(r[1] * 2 + r[2])
 
 
 def find_textures_in_dir(folder: str) -> list[str]:
@@ -540,8 +560,8 @@ def build_texture_name_cache(
             keep = 4
 
         # Generate a suffix that doesn't collide with an already-used name
-        for _ in range(100):
-            short_stem = stem[:keep] + "_" + _random_suffix(4)
+        for i in range(100):
+            short_stem = stem[:keep] + "_" + _random_suffix(f"{lc}{i or ''}", 4)
             short_name = short_stem + ext
             if short_name not in used_names:
                 break
@@ -582,7 +602,7 @@ def build_safe_texture_dst(
             keep = allowed - 5
             if keep < 4:
                 keep = 4
-            safe_fname = stem[:keep] + "_" + _random_suffix(4) + ext
+            safe_fname = stem[:keep] + "_" + _random_suffix(tex_fname_lc, 4) + ext
             _warn(f"Texture name too long, shortened: '{tex_fname_lc}' -> '{safe_fname}'")
         else:
             safe_fname = tex_fname_lc
@@ -1105,8 +1125,8 @@ def extract_zip_to_temp(zip_path: str) -> str:
 
 def find_fbx_and_zips(root_dir: str) -> list[tuple[str, str | None, str | None]]:
     skip_prefixes = (
-        os.path.join(root_dir, "models",    ASSETS_SUBFOLDER),
-        os.path.join(root_dir, "materials", ASSETS_SUBFOLDER),
+        os.path.join(root_dir, "models",    _ASSETS_DIR),
+        os.path.join(root_dir, "materials", _ASSETS_DIR),
     )
     fbx_list: list[tuple[str, str | None, str | None]] = []
 
@@ -1145,16 +1165,20 @@ def process_group(
     tmp_dir: str | None,
     zip_path: str | None,
     original_root: str,
+    asset_type: str | None = None,
 ) -> bool:
     has_lod    = len(fbx_paths) > 1
+    set_out_root(root_dir)
     group_name = os.path.basename(group_key).lower()
     group_name = shorten_group_name(group_name)
 
     _log(f"\n  [{group_name}]")
-    asset_type = get_asset_type(fbx_paths[0], original_root, tmp_dir, zip_path)
+    # CS2 Porter: the type (foliage / static and its collision) can be given per model
+    if asset_type is None:
+        asset_type = get_asset_type(fbx_paths[0], original_root, tmp_dir, zip_path)
 
-    model_dir    = os.path.join(root_dir, "models",    ASSETS_SUBFOLDER, group_name)
-    material_dir = os.path.join(root_dir, "materials", ASSETS_SUBFOLDER, group_name)
+    model_dir    = os.path.join(root_dir, "models",    _ASSETS_DIR, group_name)
+    material_dir = os.path.join(root_dir, "materials", _ASSETS_DIR, group_name)
     os.makedirs(model_dir,    exist_ok=True)
     os.makedirs(material_dir, exist_ok=True)
 
@@ -1233,7 +1257,7 @@ def process_group(
     # This ensures every texture always maps to the same safe filename,
     # so the files copied in Pass 1 and the paths written into .vmat in Pass 2
     # are always consistent.
-    all_tex_fnames = [os.path.basename(t) for t in all_textures]
+    all_tex_fnames = [texnames.out_name(t) for t in all_textures]
     name_cache = build_texture_name_cache(all_tex_fnames, game_prefix)
 
     # --- Build a per-material slot map ---
@@ -1245,9 +1269,13 @@ def process_group(
     opacity_remap: dict[str, str] = {}  # original_path -> converted_path (may be same)
 
     for tex_src in all_textures:
-        tex_fname = os.path.basename(tex_src)
+        tex_fname = texnames.out_name(tex_src)
         dst, _ = build_safe_texture_dst(material_dir, tex_fname, game_prefix, name_cache)
-        _copy_if_missing(tex_src, dst)
+        if not os.path.exists(dst):
+            try:
+                texnames.write_texture(tex_src, dst)
+            except Exception as e:  # noqa: BLE001
+                _warn(f"Could not copy {os.path.basename(tex_src)}: {e}")
 
         # Check if this is an opacity texture
         clf = _classify_texture(tex_src)
@@ -1266,7 +1294,7 @@ def process_group(
         """Replace opacity texture paths with their greyscale equivalents."""
         result = []
         for t in tex_list:
-            tex_fname = os.path.basename(t)
+            tex_fname = texnames.out_name(t)
             dst, _ = build_safe_texture_dst(material_dir, tex_fname, game_prefix, name_cache)
             grey = opacity_remap.get(dst)
             if grey and grey != dst:
@@ -1285,7 +1313,7 @@ def process_group(
         # Build game paths, remapping opacity->greyscale where applicable
         slot_map_game: dict[str, str] = {}
         for slot, tex_src in slot_map_raw.items():
-            tex_fname = os.path.basename(tex_src)
+            tex_fname = texnames.out_name(tex_src)
             dst, gpath = build_safe_texture_dst(material_dir, tex_fname, game_prefix, name_cache)
             # Remap opacity textures to greyscale version
             if slot == "TextureLayer1Translucency":

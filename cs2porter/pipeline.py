@@ -4,6 +4,7 @@ import collections
 import os
 import re
 import shutil
+import threading
 import time
 
 from . import __version__, bhop, i18n
@@ -23,8 +24,9 @@ from . import uvfix
 from . import vmap as vmapmod
 from . import vmf as vmfmod
 from .i18n import t, t_en
-from .materials import (BROKEN_CABLE_MATERIALS, MaterialConverter, out_name, write_black_material,
-                        write_cable_fallback)
+from . import materials as materialsmod
+from .materials import (BLACK_MATERIALS, BROKEN_CABLE_MATERIALS, MaterialConverter, out_name,
+                        write_black_material, write_cable_fallback)
 from .models import ModelConverter, QCIndex, norm_model
 from .skybox import MOONDOME_VMAT, SKY_VMAT, build_skybox
 from .sources import AssetSources, CS2Index, DirSource, VPKSource
@@ -143,6 +145,7 @@ class Report:
         self.models = {}
         self.skybox = None
         self.created_files = []
+        self.sprite_textures = {}   # sprite material -> its converted texture
         self.content_dir = ""
         self.work_dir = ""
         self.vmf_path = ""
@@ -474,8 +477,9 @@ def _texture_lights(ctx, info):
 
 
 def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, game_dir,
-                   staging_dir, valve, p0=0.3, p1=0.9, texture_lights=None):
-    """materials: {mat: set(usage)}, models: {mdl: count}"""
+                   staging_dir, valve, p0=0.3, p1=0.9, texture_lights=None, model_skins=None):
+    """materials: {mat: set(usage)}, models: {mdl: count}, model_skins: {mdl: skins the map
+    uses, None = any}"""
     opts = cfg["opts"]
     index = CS2Index(cfg.get("cs2_dir", ""), content_dir, game_dir, log=ctx.log)
     if index.paths:
@@ -491,6 +495,7 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
                                staging_dir=staging_dir, log=ctx.log,
                                overwrite=opts.get("overwrite", False),
                                convert_cs2_existing=opts.get("convert_cs2_existing", False))
+    modelconv.skins_used = model_skins or {}
     tools_skipped = {k for k in materials if _is_tool(k) and not matconv.own_tool(k)}
     mats = {k: set(v) for k, v in materials.items() if k not in tools_skipped}
     total = max(1, len(models) + len(mats) + 1)
@@ -538,15 +543,19 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
         skipped = sum(1 for r in report.materials.values() if r.status in ("cs2", "exists", "tool"))
         if skipped:
             ctx.log(t("p_skipped_mats", n=skipped), "dim")
+    modelconv.fix_mesh_materials()
+    report.sprite_textures.update(matconv.sprite_textures)
     if tools_skipped:
         ctx.log(t("p_tools_skipped", n=len(tools_skipped)), "dim")
 
 
 def make_skybox(cfg, ctx, report, sources, content_dir, skyname):
-    """Builds skybox.png / skybox.vmat / skybox_moondome.vmat. True if they can be used."""
+    """Builds skybox.png / skybox.vmat (and skybox_moondome.vmat when the sky brushes use it).
+    True if they can be used."""
     ctx.check()
     st, detail = build_skybox(sources, content_dir, skyname, config.VTFCMD,
-                              cfg["opts"].get("overwrite", False), ctx.log)
+                              cfg["opts"].get("overwrite", False), ctx.log,
+                              moondome=bool(cfg["opts"].get("sky_moondome", True)))
     report.skybox = f"{skyname}: {t_en('st_' + st)} ({detail})"
     ctx.result("skybox", SKY_VMAT, st, detail, "")
     ctx.log(t("p_skybox", sky=skyname, status=status_text(st), detail=detail),
@@ -767,6 +776,45 @@ def write_particles(ctx, content_dir, kinds, overwrite=False, generated=None):
                 ctx.log(t("snd_fail", f=rel, e=e), "err")
 
 
+def _image_size(path):
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:  # noqa: BLE001 - the particle keeps its usual size
+        return None
+
+
+def write_glow_particles(ctx, content_dir, glows):
+    """glows: {vpcf: 'materials/x.tga'}: copies of glow_particle.vpcf that draw the sprite's own
+    texture (a .vtex is written next to the texture)."""
+    if not glows:
+        return
+    try:
+        with open(os.path.join(config.ASSETS_DIR, "glow_particle.vpcf"), "r", encoding="utf-8") as f:
+            base = f.read()
+    except OSError:
+        return
+    for rel, tex in sorted(glows.items()):
+        vtex = tex.rsplit(".", 1)[0] + ".vtex"
+        try:
+            vtex_abs = os.path.join(content_dir, *vtex.split("/"))
+            with open(vtex_abs, "w", encoding="utf-8", newline="\n") as f:
+                f.write(particlesmod.VTEX_TEMPLATE.replace("$FILE", tex))
+            dst = os.path.join(content_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            text = re.sub(r'm_hTexture = resource:"[^"]*"', f'm_hTexture = resource:"{vtex}"', base)
+            # a Source 1 sprite is as many units wide as its texture has pixels (times its scale)
+            size = _image_size(os.path.join(content_dir, *tex.split("/")))
+            if size:
+                text = text.replace("m_flLiteralValue = 48.0", f"m_flLiteralValue = {max(size) / 2.0:.1f}", 1)
+            with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            ctx.log(t("p_particle", f=rel), "ok")
+        except OSError as e:
+            ctx.log(t("snd_fail", f=rel, e=e), "err")
+
+
 def missing_rope_materials(report, ropes):
     """Rope materials that are neither in CS2 nor converted, or that CS2 draws broken (they get
     the black material)."""
@@ -886,6 +934,75 @@ def _detail_files(ctx, folder, key):
             kinds[os.path.splitext(f)[1].lower().lstrip(".") or "?"] += 1
     if kinds:
         ctx.detail(t(key, n=sum(kinds.values()), list=", ".join(f"{k} {n}" for k, n in kinds.most_common())))
+
+
+# the program's own material that stands in for a model material found nowhere (option
+# model_placeholder); CS2 does not compile a model whose material is missing. The remap keeps
+# the real name in a comment, so the material is put back once it exists and Find Missing
+# still lists it.
+PLACEHOLDER_VMAT = f"materials/{materialsmod.PLACEHOLDER_VMAT}.vmat"
+_PH_MARK = "// cs2porter placeholder for "
+_VMDL_REF_RE = re.compile(r'(\b(?:to|global_default_material)\s*=\s*)"([^"]+\.vmat)"'
+                          r'([ \t]*// cs2porter placeholder for (\S+\.vmat))?', re.I)
+
+
+def model_placeholders(cfg, ctx, content_dir, game_dir):
+    """Puts PLACEHOLDER_VMAT into the remaps of the addon's models whose material is neither in
+    the addon nor in CS2 (and the real material back once it is there). Every model that uses a
+    placeholder gets a warning row."""
+    base = os.path.join(content_dir, "models")
+    if not os.path.isdir(base):
+        return
+    on = bool(cfg["opts"].get("model_placeholder", True))
+    index = None
+    placed = 0
+    for dp, _dn, fn in os.walk(base):
+        for f in fn:
+            if not f.lower().endswith(".vmdl"):
+                continue
+            path = os.path.join(dp, f)
+            try:
+                with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if not _VMDL_REF_RE.search(text):
+                continue
+            if index is None:
+                index = CS2Index(cfg.get("cs2_dir", ""), content_dir, game_dir)
+            hits = []
+
+            def have(vmat):
+                return index.in_addon(vmat) or index.in_cs2(vmat + "_c")
+
+            def sub(m):
+                key, vmat, _mark, orig = m.groups()
+                if orig:
+                    if not on or have(orig):
+                        return f'{key}"{orig}"'
+                    hits.append(orig)
+                    return f'{key}"{PLACEHOLDER_VMAT}" {_PH_MARK}{orig}'
+                v = vmat.replace("\\", "/").lower()
+                if not on or not v.startswith("materials/") or have(v):
+                    return m.group(0)
+                hits.append(v)
+                return f'{key}"{PLACEHOLDER_VMAT}" {_PH_MARK}{v}'
+
+            new = _VMDL_REF_RE.sub(sub, text)
+            if new != text:
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(new)
+            if not hits:
+                continue
+            rel = os.path.relpath(path, content_dir).replace("\\", "/")
+            names = sorted({h[len("materials/"):-len(".vmat")] for h in hits})
+            placed += 1
+            ctx.log(t("p_placeholder", model=rel, mats=", ".join(names)), "warn")
+            for name in names:
+                ctx.result("model", rel, "placeholder", t("m_placeholder", mat=name), "")
+    if placed:
+        materialsmod.write_placeholder_material(content_dir)
+        ctx.log(t("p_placeholder_sum", n=placed, mat=PLACEHOLDER_VMAT), "warn")
 
 
 def compile_assets(cfg, ctx, valve, content_dir, game_dir, work):
@@ -1023,6 +1140,23 @@ def _light_setup(ctx, opts, root, info, tracer):
     return vmfmod.collect_lights(root, values), bounds, rooms
 
 
+_ADDON_MAKE_LOCK = threading.Lock()
+
+
+def _hold_addon(ctx):
+    """Maps ported into the same addon at the same time take turns from the import on (they
+    write the same files); reading the .bsp and decompiling it runs side by side. port_maps
+    gives ctx the addon's lock and lets it go when the map ends."""
+    lock = getattr(ctx, "addon_lock", None)
+    if lock is None or getattr(ctx, "addon_held", False):
+        return
+    if not lock.acquire(blocking=False):
+        ctx.log(t("p_addon_wait"), "dim")
+        while not lock.acquire(timeout=0.5):
+            ctx.check()
+    ctx.addon_held = True
+
+
 def port_map(cfg, ctx, input_path, addon_name):
     t0 = time.time()
     opts = cfg["opts"]
@@ -1057,7 +1191,8 @@ def port_map(cfg, ctx, input_path, addon_name):
         raise ToolError(t("vt_no_bspsource", path=config.BSPSOURCE_DIR))
 
     if cs2_ok:
-        content_dir, game_dir, created = valve.ensure_addon(addon)
+        with _ADDON_MAKE_LOCK:
+            content_dir, game_dir, created = valve.ensure_addon(addon)
         if created:
             ctx.log(t("p_new_addon", addon=addon), "ok")
     else:
@@ -1111,6 +1246,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             nonsolid = 0
         if nonsolid:
             ctx.detail(t("d_nonsolid", n=nonsolid))
+    vmfmod.normalize_material_names(root)
     vinfo = vmfmod.analyze(root)
     ctx.log(t("p_analyze_counts", brushes=vinfo.brush_count, disps=vinfo.disp_count, ents=vinfo.entity_count), "info")
     ctx.log(t("p_analyze_assets", mats=len(vinfo.materials), mdls=len(vinfo.models), sky=vinfo.skyname or "-"), "info")
@@ -1132,11 +1268,16 @@ def port_map(cfg, ctx, input_path, addon_name):
         if shells:
             ctx.detail(t("d_room_shells", n=shells))
     bhop_on = bool(opts.get("bhop_script", True))
+    # until the user sets the bhop blocks option, bhop_ maps get it and the others do not
+    blocks = bool(opts.get("bhop_blocks", False)) if cfg.get("bhop_blocks_user") else \
+        map_name.lower().startswith("bhop_")
     attributes, meshes, effects = {}, {}, {}
+    # the faces the infodecals sit on (the importer places their quads in front of them)
+    decals = vmfmod.decal_surfaces(root)
     vmfmod.fix_for_cs2(root, sky_alias=sky_alias, attributes=attributes, meshes=meshes,
                        teleport_key=vmapmod.TELEPORT_KEY if bhop_on else None,
                        split_triggers=bool(opts.get("split_triggers", True)), effects=effects, log=ctx.log,
-                       bhop_blocks=bool(opts.get("bhop_blocks", True)), world=tracer)
+                       bhop_blocks=blocks, world=tracer)
     del tracer
     vmfmod.write_vmf(root, vmf_path)
     # texture lights, and the faces of the ones that may need lights in front of them (water)
@@ -1155,6 +1296,7 @@ def port_map(cfg, ctx, input_path, addon_name):
     models = dict(vinfo.models)
     # CS:GO maps (BSP v21+) look in CS:GO files first, older maps in CSS files first
     prefer = ("csgo",) if (not is_vmf and info.version >= 21) else ("cstrike",)
+    _hold_addon(ctx)
     sources = open_sources(cfg, ctx, embedded_dir if os.path.isdir(embedded_dir) else None, prefer=prefer)
     try:
         # --- 3) map geometry (import) ---------------------------------------
@@ -1202,7 +1344,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             shutil.rmtree(staging_dir, ignore_errors=True)
         convert_assets(cfg, ctx, report, sources, materials, models,
                        content_dir, game_dir, staging_dir, valve if cs2_ok else None, 0.3, 0.85,
-                       texture_lights=tex_lights or None)
+                       texture_lights=tex_lights or None, model_skins=vinfo.model_skins)
         _summary(ctx, report)
         ctx.check()
 
@@ -1220,7 +1362,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             underwater = _underwater(ctx, opts, content_dir, water_set)
             surface_lights = _surface_lights(ctx, sources, glow_rects, tex_lights)
             fx = vmapmod.Fixes(sky_alias=sky_alias, sky_vmat=SKY_VMAT if sky_ok else None,
-                               moondome_vmat=MOONDOME_VMAT if sky_ok else None, lights=lights,
+                               moondome_vmat=MOONDOME_VMAT if sky_ok and opts.get("sky_moondome", True) else None, lights=lights,
                                lumens=bool(opts.get("fix_light_brightness", True)),
                                bhop=bhop_on, attributes=attributes, meshes=meshes,
                                blends=blendmod.only_blends(disps, sources) if disps else None,
@@ -1229,8 +1371,10 @@ def port_map(cfg, ctx, input_path, addon_name):
                                commands=map_name.lower().startswith("bhop_"),
                                uv_sizes=uvfix.TextureSizes(content_dir),
                                effects=effects, cable_missing=cable_missing, vis_bounds=vis_bounds,
-                               light_rooms=light_rooms, particle_names=particle_names)
+                               light_rooms=light_rooms, particle_names=particle_names,
+                               sprite_textures=report.sprite_textures, decals=decals)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
+            write_glow_particles(ctx, content_dir, fx.glow_particles)
             if res.stats.get("black"):
                 # black faces (also the ones the import itself gives a black material)
                 write_black_material(content_dir)
@@ -1255,6 +1399,7 @@ def port_map(cfg, ctx, input_path, addon_name):
         sources.close()
     ctx.check()
     if cs2_ok:
+        model_placeholders(cfg, ctx, content_dir, game_dir)
         compile_assets(cfg, ctx, valve, content_dir, game_dir, work)
     for note in report.notices:
         ctx.log(note, "warn")
@@ -1281,22 +1426,20 @@ class BatchReport:
 
 
 def port_maps(cfg, ctx, jobs, parallel=PARALLEL_PORTS, on_state=None):
-    """Ports a list of maps: jobs = [(map path, addon name or "")] ("" = the map's name). Maps of
-    different addons are ported PARALLEL_PORTS at a time, maps of the same addon one after the
-    other. The log lines of a map start with its name, its table rows carry it, and every map
-    writes its own report.txt. on_state(index, state, seconds) is told when a map starts
-    ("running") and ends ("done", "failed", "cancelled")."""
+    """Ports a list of maps: jobs = [(map path, addon name or "")] ("" = the map's name).
+    PARALLEL_PORTS maps are ported at a time and a map that ends makes room for the next one at
+    once (one whose addon is not being written is taken first). Maps of the same addon take
+    turns from the import on (_hold_addon). The log lines of a map start with its name, its
+    table rows carry it, and every map writes its own report.txt. on_state(index, state,
+    seconds) is told when a map starts ("running") and ends ("done", "failed", "cancelled")."""
     import concurrent.futures
-    import threading
     import traceback
     on_state = on_state or (lambda i, state, sec=0.0: None)
     jobs = [(p, sanitize_name(a) if a else sanitize_name(os.path.splitext(os.path.basename(p))[0]))
             for p, a in jobs]
     names = [sanitize_name(os.path.splitext(os.path.basename(p))[0]) for p, _a in jobs]
-    groups = {}
-    for i, (_p, addon) in enumerate(jobs):
-        groups.setdefault(addon.lower(), []).append(i)
-    parallel = max(1, min(int(parallel or 1), MAX_PARALLEL, len(groups)))
+    addon_locks = {addon.lower(): threading.Lock() for _p, addon in jobs}
+    parallel = max(1, min(int(parallel or 1), MAX_PARALLEL, len(jobs)))
     batch = BatchReport()
     lock = threading.Lock()
     fractions = [0.0] * len(jobs)
@@ -1321,6 +1464,7 @@ def port_maps(cfg, ctx, jobs, parallel=PARALLEL_PORTS, on_state=None):
             ctx._result(kind, rname, status, detail, source, name)
 
         child = JobContext(log, progress, result, ctx.ask, ctx.cancel, ctx.choose)
+        child.addon_lock = addon_locks[addon.lower()]
         child.begin()
         t0 = time.time()
         on_state(i, "running")
@@ -1345,28 +1489,50 @@ def port_maps(cfg, ctx, jobs, parallel=PARALLEL_PORTS, on_state=None):
             on_state(i, "failed")
             return None, t("unexpected_error", e=e), time.time() - t0
         finally:
+            if getattr(child, "addon_held", False):
+                child.addon_held = False
+                child.addon_lock.release()
             progress(1.0)
             child.end()
 
-    def chain(indices):
-        # the maps of one addon, one after the other
-        out = []
-        for i in indices:
-            if ctx.cancel is not None and ctx.cancel.is_set():
-                on_state(i, "cancelled")
-                continue
-            out.append((i,) + one(i))
-        return out
+    pending = list(range(len(jobs)))
+    busy = collections.Counter()    # maps running per addon
 
-    cancelled = False
+    def take():
+        with lock:
+            if not pending:
+                return None
+            i = next((k for k in pending if not busy[jobs[k][1].lower()]), pending[0])
+            pending.remove(i)
+            busy[jobs[i][1].lower()] += 1
+            return i
+
+    def worker():
+        out = []
+        while True:
+            i = take()
+            if i is None:
+                return out
+            try:
+                if ctx.cancel is not None and ctx.cancel.is_set():
+                    on_state(i, "cancelled")
+                    continue
+                out.append((i,) + one(i))
+            except Cancelled:
+                stopped.append(i)
+            finally:
+                with lock:
+                    busy[jobs[i][1].lower()] -= 1
+
+    stopped = []
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
-        futures = [pool.submit(chain, idx) for idx in groups.values()]
+        futures = [pool.submit(worker) for _n in range(parallel)]
         for fut in concurrent.futures.as_completed(futures):
-            try:
-                results += fut.result()
-            except Cancelled:
-                cancelled = True
+            results += fut.result()
+    cancelled = bool(stopped) or (ctx.cancel is not None and ctx.cancel.is_set())
+    for i in pending:
+        on_state(i, "cancelled")
     for i, rep, err, sec in sorted(results):
         batch.reports.append((jobs[i][0], rep, err))
         if rep is not None:
@@ -1505,7 +1671,7 @@ def _source_game(src):
     game = getattr(src, "game", "")
     if game:
         return game
-    if src.role == "embedded":
+    if src.role in ("embedded", "copies"):
         return t("src_embedded")
     root = getattr(src, "root", "") or getattr(src, "dir_path", "")
     if src.role == "resources" and root:
@@ -1683,9 +1849,125 @@ def export_files(ctx, items, out_dir, flat=False, cfg=None, extra=None):
     return None
 
 
-def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=None):
+def _addon_index(cfg, ctx, addon_name):
+    cs2_dir = cfg.get("cs2_dir", "")
+    addon = sanitize_name(addon_name)
+    content_dir = os.path.join(cs2_dir, "content", "csgo_addons", addon)
+    game_dir = os.path.join(cs2_dir, "game", "csgo_addons", addon)
+    return CS2Index(cs2_dir, content_dir, game_dir if os.path.isdir(game_dir) else None, log=ctx.log)
+
+
+def _vmdl_materials(path):
+    """The materials a .vmdl names (materials/x.vmat, lower case; the real one of a placeholder)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    out = []
+    for m in _VMDL_REF_RE.finditer(text):
+        p = (m.group(4) or m.group(2)).replace("\\", "/").lower().lstrip("/")
+        p = p if p.startswith("materials/") else "materials/" + p
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def scan_missing(cfg, ctx, vmap, addon_name):
+    """Materials and models a ported map uses that are neither in its addon nor in CS2.
+    report.missing: ([materials], [models])."""
+    t0 = time.time()
+    report = Report()
+    mats, mdls = read_vmap_refs(vmap)
+    ctx.log(t("p_ref_file", file=os.path.basename(vmap), mats=len(mats), mdls=len(mdls)), "head")
+    _sky_from_refs(mats)            # the sky faces are made by the port (or the add step)
+    index = _addon_index(cfg, ctx, addon_name)
+    miss_mats, miss_mdls, model_vmdls = [], [], []
+    items = [("model", m) for m in sorted(mdls)] + [("material", m) for m in sorted(mats)]
+    for i, (kind, name) in enumerate(items):
+        ctx.check()
+        ctx.progress((i + 1) / max(len(items), 1), name[-60:])
+        if kind == "material":
+            if _is_tool(name) or name in BLACK_MATERIALS:
+                continue
+            rel = f"materials/{out_name(name)}.vmat"
+        else:
+            rel = out_name(name[:-4]) + ".vmdl"
+        if index.in_addon(rel) or index.in_cs2(rel + "_c"):
+            if kind == "model" and index.in_addon(rel):
+                model_vmdls.append((name, rel))
+            continue
+        (miss_mats if kind == "material" else miss_mdls).append(name)
+        ctx.result(kind, name, "missing", t("miss_not_in_addon"), "")
+    # the materials the addon's models use (their .vmdl remaps)
+    listed = set(miss_mats)
+    for name, rel in model_vmdls:
+        ctx.check()
+        for vmat in _vmdl_materials(os.path.join(index.content_dir, *rel.split("/"))):
+            mat = vmat[len("materials/"):-len(".vmat")]
+            if mat in listed or _is_tool(mat) or index.in_addon(vmat) or index.in_cs2(vmat + "_c"):
+                continue
+            listed.add(mat)
+            miss_mats.append(mat)
+            ctx.result("material", mat, "missing", t("miss_model_material", model=name), "")
+    report.missing = (miss_mats, miss_mdls)
+    n = len(miss_mats) + len(miss_mdls)
+    ctx.log(t("miss_scan_done", n=n, mats=len(miss_mats), mdls=len(miss_mdls), sec=time.time() - t0),
+            "warn" if n else "ok")
+    return report
+
+
+def search_missing(cfg, ctx, mats, mdls):
+    """Looks for the missing assets in the resource folders and the installed games.
+    report.found: ([materials], [models]) that can be added."""
+    t0 = time.time()
+    report = Report()
+    sources = open_sources(cfg, ctx)
+    found_mats, found_mdls = [], []
+    try:
+        qc_index = QCIndex(sources.resource_sources(), config.CACHE_DIR, ctx.log)
+        items = [("model", m) for m in mdls] + [("material", m) for m in mats]
+        ctx.log(t("miss_search_start", n=len(items)), "head")
+        for i, (kind, name) in enumerate(items):
+            ctx.check()
+            ctx.progress((i + 1) / max(len(items), 1), name[-60:])
+            src, rel = None, ""
+            if kind == "material":
+                rel = f"materials/{name}.vmt"
+                src = sources.find(rel)
+                if src is None:
+                    src, rel, _ext = sources.find_texture(name)
+            else:
+                rel = name
+                src = sources.find(rel)
+                if src is None and qc_index.find(name):
+                    qc = qc_index.find(name)
+                    ctx.result(kind, name, "found", t("miss_found_qc"), qc, os.path.basename(os.path.dirname(qc)))
+                    found_mdls.append(name)
+                    continue
+            if src is None:
+                ctx.result(kind, name, "missing", t("miss_not_found_any"), "")
+                continue
+            if isinstance(src, DirSource):
+                where = src.path(rel) or src.root
+            elif isinstance(src, VPKSource):
+                where = src.dir_path
+            else:
+                where = ""
+            ctx.result(kind, name, "found", src.label, where, _source_game(src))
+            (found_mats if kind == "material" else found_mdls).append(name)
+    finally:
+        sources.close()
+    report.found = (found_mats, found_mdls)
+    n = len(found_mats) + len(found_mdls)
+    ctx.log(t("miss_search_done", n=n, total=len(mats) + len(mdls), sec=time.time() - t0), "ok" if n else "warn")
+    return report
+
+
+def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=None, only=None):
     """source: {"vmap": path} (every asset the map uses is checked) or {"text": pasted text}
-    (paths in a compile / console log or any list)."""
+    (paths in a compile / console log or any list). only: ([materials], [models]) to add, the
+    rest the map uses is left alone."""
     t0 = time.time()
     report = Report()
     report.input_path = source.get("vmap") or ""
@@ -1700,6 +1982,10 @@ def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=
         mats, mdls = parse_reference_text(source.get("text", ""))
         ctx.log(t("p_ref_text", mats=len(mats), mdls=len(mdls)), "info")
     skyname = _sky_from_refs(mats)
+    if only is not None:
+        mats = {m: mats.get(m, {"ref"}) for m in only[0]}
+        mdls = {m: 1 for m in only[1]}
+        skyname = ""
     if extra_dir and extra_dir.lower().endswith(".bsp") and os.path.isfile(extra_dir):
         try:
             skyname = bspmod.BSPInfo(extra_dir).worldspawn_keys().get("skyname", "").strip() or skyname
@@ -1761,6 +2047,7 @@ def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=
         sources.close()
     _summary(ctx, report)
     if cs2_ok and game_dir:
+        model_placeholders(cfg, ctx, content_dir, game_dir)
         compile_assets(cfg, ctx, valve, content_dir, game_dir, work)
     _finish(ctx, report, work, t_en("report_title_missing"), t0)
     return report

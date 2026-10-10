@@ -132,6 +132,42 @@ def normalize_material(name):
     return n
 
 
+def normalize_material_names(root):
+    """Brush face, overlay and decal materials written as "materials/x", "x.vmt" or with
+    backslashes become "x": the importer keeps such a name as it is (materials/materials/x),
+    finds no VMT for it and gets the texture size, and so the texture scale, wrong."""
+    def fix(node, key):
+        v = node.get(key)
+        if not v:
+            return 0
+        n = normalize_material(v)
+        if n and n != v.strip().lower():
+            node.set(key, n)
+            return 1
+        return 0
+
+    def solids(node):
+        count = 0
+        for solid in node.children("solid"):
+            count += sum(fix(side, "material") for side in solid.children("side"))
+        for hidden in node.children("hidden"):
+            count += solids(hidden)
+        return count
+
+    count = 0
+    world = root.child("world")
+    if world is not None:
+        count += solids(world)
+    for ent in root.children("entity"):
+        count += solids(ent)
+        cls = ent.classname
+        if cls == "info_overlay":
+            count += fix(ent, "material")
+        elif cls == "infodecal":
+            count += fix(ent, "texture")
+    return count
+
+
 def normalize_model(name):
     n = name.strip().replace("\\", "/").lower()
     while "//" in n:
@@ -161,6 +197,7 @@ class VmfInfo:
     def __init__(self):
         self.materials = {}       # mat -> set(usage)
         self.models = {}          # mdl -> count
+        self.model_skins = {}     # mdl -> set of skins the map uses (None = any skin)
         self.skyname = ""
         self.brush_count = 0
         self.side_count = 0
@@ -174,9 +211,23 @@ class VmfInfo:
             return
         self.materials.setdefault(n, set()).add(usage)
 
-    def add_model(self, name):
+    def add_model(self, name, skin=None):
         n = normalize_model(name)
         self.models[n] = self.models.get(n, 0) + 1
+        used = self.model_skins.get(n, set())
+        if used is not None:
+            self.model_skins[n] = None if skin is None else used | {skin}
+
+
+def _skin_of(ent, skin_targets):
+    """The skin an entity shows, None when outputs can change it."""
+    name = (ent.get("targetname") or "").lower()
+    if name and any(name == t or (t.endswith("*") and name.startswith(t[:-1])) for t in skin_targets):
+        return None
+    try:
+        return int(float(ent.get("skin") or 0))
+    except ValueError:
+        return 0
 
 
 def _collect_solids(node, info, usage):
@@ -201,14 +252,20 @@ def analyze(root):
         for hidden in world.children("hidden"):
             _collect_solids(hidden, info, "brush")
 
+    # entities whose skin an output changes (Skin input) can show any skin
+    skin_targets = {o[1].strip().lower() for ent in root.children("entity") for o in _outputs(ent)
+                    if len(o) >= 3 and o[2].strip().lower() in ("skin", "setskin")}
     for ent in root.children("entity"):
         info.entity_count += 1
         cls = ent.classname
         info.entity_classes[cls] = info.entity_classes.get(cls, 0) + 1
         brush_usage = "brush" if cls == "func_detail" else "brushent"
-        _collect_solids(ent, info, brush_usage)
-        for hidden in ent.children("hidden"):
-            _collect_solids(hidden, info, brush_usage)
+        # brush effects (func_dustmotes ...) become particles and lose their brushes, so their
+        # materials are not needed
+        if cls not in EFFECT_CLASSES:
+            _collect_solids(ent, info, brush_usage)
+            for hidden in ent.children("hidden"):
+                _collect_solids(hidden, info, brush_usage)
 
         for key, val in ent.kvs():
             if not val:
@@ -216,7 +273,7 @@ def analyze(root):
             k = key.lower()
             vl = val.lower().strip()
             if vl.endswith(".mdl"):
-                info.add_model(val)
+                info.add_model(val, _skin_of(ent, skin_targets) if k == "model" else None)
                 continue
             if k == "model" and cls in _SPRITE_CLASSES:
                 if vl.endswith(".vmt") or vl.endswith(".spr"):
@@ -589,6 +646,20 @@ def _bhop_blocks(root, teleport_key):
     root.items = [i for i in root.items
                   if not (isinstance(i, VNode) and id(i) in flag_triggers and flag_triggers[id(i)] in used_flags)]
     return blocks, before - len(root.items)
+
+
+def _fix_model_scale(ent):
+    """modelscale (prop_dynamic, prop_physics ...) is lost on import, uniformscale becomes the
+    entity's scale: a prop with a modelscale other than 1 gets it as uniformscale."""
+    i = ent.index_of_key("modelscale")
+    if i == -1:
+        return False
+    scale = _float(ent.items[i][1], 1.0)
+    del ent.items[i]
+    if ent.index_of_key("uniformscale") != -1 or scale <= 0 or abs(scale - 1) < 1e-4:
+        return False
+    ent.set("uniformscale", f"{scale:g}")
+    return True
 
 
 def _fix_dynamic_prop(ent):
@@ -1573,9 +1644,12 @@ _LIGHT_CLASSES = {"light": "light_omni2", "light_spot": "light_barn", "light_dyn
 
 
 def _light_value(text):
-    """4th value of "r g b brightness" (None when missing)."""
+    """4th value of "r g b brightness" (None when missing). Without the 4th value vrad uses the
+    color as it is, which is brightness 255."""
     parts = (text or "").split()
-    return _float(parts[3]) if len(parts) >= 4 else None
+    if len(parts) >= 4:
+        return _float(parts[3])
+    return 255.0 if parts and _float(parts[0]) is not None else None
 
 
 def _round2(v):
@@ -1710,14 +1784,18 @@ EFFECT_VPCFS = {"steam": STEAM_VPCF, "dustmotes": DUSTMOTES_VPCF, "spotlight": L
 # dustmotes.vpcf drawn from farther away
 GENERATED_VPCF_DIR = "particles/cs2porter"
 BOX_DRAW_DISTANCE = 5000
-EFFECT_CLASSES = ("env_steam", "func_dustmotes", "point_spotlight", "env_spritetrail", "func_dustcloud",
-                  "env_embers", "func_smokevolume", "env_smoketrail")
+EFFECT_CLASSES = ("env_steam", "func_dustmotes", "point_spotlight", "beam_spotlight", "env_spritetrail", "func_dustcloud",
+                  "env_embers", "func_smokevolume", "env_smoketrail", "env_fire")
+# env_fire spawnflags
+FIRE_SMOKELESS = 2
+FIRE_START_ON = 4
 # inputs of the old entities -> info_particle_system inputs (the others are reported)
 EFFECT_INPUTS = {
     "steam": {"turnon": "Start", "turnoff": "Stop"},
     "dustmotes": {"turnon": "Start", "turnoff": "Stop"},
     "dustcloud": {"turnon": "Start", "turnoff": "Stop"},
     "spotlight": {"lighton": "Start", "lightoff": "DestroyImmediately"},
+    "fire": {"startfire": "Start", "extinguish": "Stop", "extinguishtemporary": "Stop"},
 }
 _EFFECT_KEEP = ("id", "classname", "targetname", "parentname", "origin", "angles")
 # a heat wave env_steam only bends the view behind it: it becomes a faint haze
@@ -1835,6 +1913,50 @@ class BrushTracer:
                 if hit is not None and 0.5 < hit < best:
                     best = hit
         return best
+
+
+# an infodecal sticks to a face this far from it at most (in front of it, or a little behind)
+DECAL_REACH = 16.0
+DECAL_BEHIND = 1.0
+
+
+def decal_surfaces(root, tracer=None):
+    """[(point, material, normal, origin)] of the infodecals: normal is the outward normal of the
+    world / func_detail face each one sits on and point the decal's place on it (normal None and
+    point = origin when there is no such face). The importer turns an infodecal
+    into a quad 16 units in front of a face it picks, sometimes the back of a thin brush; the
+    .vmap step puts the quad back onto this face."""
+    decals = [e for e in root.children("entity") if e.classname == "infodecal"]
+    if not decals:
+        return []
+    tracer = tracer or BrushTracer(root)
+    out = []
+    for ent in decals:
+        o = _vec(ent.get("origin"))
+        mat = normalize_material(ent.get("texture") or "")
+        if o is None or not mat:
+            continue
+        best = None
+        for mins, maxs, solid, pts in tracer.solids:
+            if any(o[k] < mins[k] - DECAL_REACH or o[k] > maxs[k] + DECAL_REACH for k in range(3)):
+                continue
+            for n, d in tracer._brush_planes(solid, pts):
+                gap = n[0] * o[0] + n[1] * o[1] + n[2] * o[2] - d
+                if not -DECAL_BEHIND <= gap <= DECAL_REACH:
+                    continue
+                foot = tuple(o[k] - n[k] * gap for k in range(3))
+                # the point on the face must be on this brush, with open space in front of it
+                if any(foot[k] < mins[k] - 0.5 or foot[k] > maxs[k] + 0.5 for k in range(3)):
+                    continue
+                if any(n2[0] * foot[0] + n2[1] * foot[1] + n2[2] * foot[2] - d2 > 0.5
+                       for n2, d2 in tracer._brush_planes(solid, pts) if n2 is not n):
+                    continue
+                if tracer.trace(tuple(foot[k] + n[k] * 0.25 for k in range(3)), n, 2.0) < 2.0:
+                    continue
+                if best is None or abs(gap) < best[0]:
+                    best = (abs(gap), n, foot)
+        out.append((best[2] if best else o, mat, best[1] if best else None, o))
+    return out
 
 
 def _ray_triangle(o, d, a, b, c):
@@ -2068,7 +2190,7 @@ def _effect_props(ent, cls, tracer=None, lights=None):
         return "smoketrail", _vec(ent.get("origin")), {
             "start_active": "1", "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255",
             "_params": _smoketrail_params(ent, num)}
-    if cls == "point_spotlight":
+    if cls in ("point_spotlight", "beam_spotlight"):
         length = max(num("SpotlightLength", 500.0), 1.0)
         fwd = _forward(_vec(ent.get("angles")))
         origin = _vec(ent.get("origin"))
@@ -2087,6 +2209,16 @@ def _effect_props(ent, cls, tracer=None, lights=None):
             "start_active": "1" if flags & 1 else "0",
             "data_cp_value": f"{_fmt(length)} {_fmt(round(width, 2))} {_fmt(round(alpha, 3))}",
             "tint_cp_color": color}
+    if cls == "env_fire":
+        # CS2 has the fire effects of Source 1's env_fire, by size, with or without smoke
+        size = num("firesize", 64.0)
+        flags = _spawnflags(ent)
+        name = "tiny" if size < 48 else "small" if size < 96 else "medium" if size < 192 else "large"
+        smoke = "" if flags & FIRE_SMOKELESS else "_smoke"
+        return "fire", _vec(ent.get("origin")), {
+            "start_active": "1" if flags & FIRE_START_ON else "0",
+            "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255",
+            "_effect": f"particles/burning_fx/env_fire_{name}{smoke}.vpcf"}
     if cls == "env_spritetrail":
         # data control point 1 = lifetime, start width, end width; the particles stay where
         # they were made while the entity (and its parent) moves on, which draws the trail
@@ -2113,7 +2245,7 @@ def _effects_to_particles(root, effects):
         cls = ent.classname
         if cls not in EFFECT_CLASSES:
             continue
-        if cls == "point_spotlight" and tracer is None:
+        if cls in ("point_spotlight", "beam_spotlight") and tracer is None:
             tracer = BrushTracer(root)
             lights = _light_positions(root)
         made = _effect_props(ent, cls, tracer, lights)
@@ -2121,7 +2253,8 @@ def _effects_to_particles(root, effects):
             continue
         kind, origin, props = made
         params = props.pop("_params", None)
-        effect = _generated_vpcf(effects, kind, params) if params else EFFECT_VPCFS[kind]
+        effect = props.pop("_effect", None) or \
+            (_generated_vpcf(effects, kind, params) if params else EFFECT_VPCFS[kind])
         props = dict(props, classname="info_particle_system", effect_name=effect,
                      data_cp="1", tint_cp="2")
         ent.items = [i for i in ent.items if isinstance(i, list) and i[0].lower() in _EFFECT_KEEP
@@ -2171,11 +2304,11 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     world: the compiled map (lighting.BspTracer), for the thin triggers that grow down towards
     the floor."""
     stats = {"base": 0, "targetnames": 0, "lights": 0, "brushes": 0, "render": 0,
-             "dynprops": 0, "skins": 0, "perfmode": 0, "particles": 0, "physbox": 0,
+             "dynprops": 0, "modelscale": 0, "skins": 0, "perfmode": 0, "particles": 0, "physbox": 0,
              "skiphint_removed": 0, "skiphint_replaced": 0, "skybox": 0, "ladders": 0,
              "booster": 0, "filters": 0, "meshes": 0, "teleports": 0, "boost": 0, "split": 0,
              "floor": 0, "effects": 0, "removed": 0, "bhop_blocks": 0, "flag_triggers": 0, "trigger_clip": 0,
-             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0}
+             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0}
     _fix_base(root)
     stats["removed"] = _remove_classes(root)
     stats["cubemaps"] = _remove_classes(root, CUBEMAP_CLASSES)
@@ -2230,6 +2363,8 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                     stats["skins"] += 1
         if _fix_dynamic_prop(ent):
             stats["dynprops"] += 1
+        if _fix_model_scale(ent):
+            stats["modelscale"] += 1
         cls = ent.classname
         if cls == "env_lightglow":
             ent.items[ent.index_of_key("classname")] = ["classname", "env_sprite"]
@@ -2246,16 +2381,21 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
         elif cls == "func_physbox_multiplayer":
             ent.items[ent.index_of_key("classname")] = ["classname", "func_physbox"]
             stats["physbox"] += 1
+        elif cls == "info_landmark":
+            # CS2 has no info_landmark; an info_target keeps its name and place
+            ent.items[ent.index_of_key("classname")] = ["classname", "info_target"]
+            stats["landmarks"] += 1
 
     stats["effects"] = _effects_to_particles(root, effects if effects is not None else {})
     stats["skiphint_removed"], stats["skiphint_replaced"] = _remove_skip_hint(root)
     if log:
         from .i18n import t
         parts = []
-        for k in ("targetnames", "lights", "brushes", "render", "dynprops", "skins", "perfmode",
+        for k in ("targetnames", "lights", "brushes", "render", "dynprops", "modelscale", "skins", "perfmode",
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
-                  "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid"):
+                  "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
+                  "landmarks"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

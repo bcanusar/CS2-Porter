@@ -168,6 +168,33 @@ def is_generated_file(name):
     return bool(_CUBEMAP_VTF_RE.match(n) or _GENERATED_RE.match(n))
 
 
+_COPY_NAME_RE = re.compile(r"^materials/maps/[^/]+/(.+?)((_wvt_patch)|(_-?\d+_-?\d+_-?\d+))+\.vmt$")
+
+
+def _recover_copy(name, data, packed, out_dir):
+    """vbsp writes a full copy of a material (a "_wvt_patch" for a blend material on a brush
+    face) next to the map; when the map did not pack the material itself, the copy is all that
+    is left of it. Written as materials/<material>.vmt under out_dir/COPIES_DIR, which the
+    sources search after everything else. Copies that only "patch" another file are skipped."""
+    m = _COPY_NAME_RE.match(name.lower())
+    if not m:
+        return None
+    orig = f"materials/{m.group(1)}.vmt"
+    if orig in packed:
+        return None
+    head = data.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if not head or head.startswith(b"patch") or head.startswith(b'"patch"'):
+        return None
+    from .sources import COPIES_DIR
+    dest = os.path.join(out_dir, COPIES_DIR, *orig.split("/"))
+    if os.path.isfile(dest) and "_wvt_patch" not in name.lower():
+        return None     # a blend copy wins over a cubemap copy
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(data)
+    return m.group(1)
+
+
 def extract_pakfile(bsp_path, out_dir, smart=True, log=None):
     """Extracts the files embedded in the BSP into out_dir. Returns the extracted relative paths."""
     info = BSPInfo(bsp_path)
@@ -178,12 +205,20 @@ def extract_pakfile(bsp_path, out_dir, smart=True, log=None):
     skipped = 0
     failed = 0
     with zf:
+        packed = {zi.filename.replace("\\", "/").lstrip("/").lower() for zi in zf.infolist()}
         for zi in zf.infolist():
             if zi.is_dir():
                 continue
             name = zi.filename.replace("\\", "/").lstrip("/")
             if smart and is_generated_file(name):
                 skipped += 1
+                if name.lower().endswith(".vmt"):
+                    try:
+                        mat = _recover_copy(name, zf.read(zi), packed, out_dir)
+                        if mat and log:
+                            log(t("bsp_copy_used", name=mat), "dim")
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             dest = os.path.join(out_dir, *name.split("/"))
             try:

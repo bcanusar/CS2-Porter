@@ -9,6 +9,8 @@ from .i18n import t
 from .vpk import VPKArchive, VPKError
 
 IMAGE_EXTS = (".tga", ".png", ".jpg", ".jpeg", ".psd", ".tif", ".tiff", ".bmp")
+# folder of the embedded files that holds the materials recovered from vbsp's copies
+COPIES_DIR = "_compiler_copies"
 
 
 def _norm(rel):
@@ -18,7 +20,7 @@ def _norm(rel):
 class DirSource:
     """A root folder of loose files (indexes materials/ and models/ under it).
 
-    role: embedded | extra | resources | game (| loose: LooseSource)
+    role: embedded | extra | resources | game | copies (| loose: LooseSource)
     """
 
     kind = "dir"
@@ -280,6 +282,10 @@ class AssetSources:
             if d and os.path.isdir(d):
                 self.sources.append(LooseSource(d, t("src_extra", name=os.path.basename(os.path.normpath(d))),
                                                 role="loose"))
+        # last: the full copies vbsp made of materials the map did not pack (bsp.COPIES_DIR)
+        copies = os.path.join(embedded_dir, COPIES_DIR) if embedded_dir else None
+        if copies and os.path.isdir(copies):
+            self.sources.append(DirSource(copies, t("src_embedded"), role="copies"))
 
     @property
     def embedded(self):

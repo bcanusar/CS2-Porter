@@ -1,8 +1,7 @@
+import hashlib
 import os
 import re
 import shutil
-import string
-import random
 import zipfile
 import tempfile
 from collections import defaultdict
@@ -10,15 +9,27 @@ from collections import defaultdict
 import numpy as np
 from PIL import Image
 
+from . import texnames
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-ASSETS_SUBFOLDER = "assets"
-TEXTURE_EXT      = {".jpg", ".jpeg", ".png", ".tga", ".bmp"}
+# CS2 Porter: the converted assets go to materials/cs2porter/assets/...
+ASSETS_SUBFOLDER = "cs2porter/assets"
+TEXTURE_EXT      = set(texnames.TEXTURE_EXTS)
 MAX_PATH         = 260
 _WIN_PREFIX      = 140
 MAX_GAME_PATH    = MAX_PATH - _WIN_PREFIX - 20   # ~100 char
+# room kept for the texture file names below a material folder
+_TEX_NAME_ROOM   = 40
+
+
+def game_path_budget(out_root):
+    """Longest game path (materials/...) that fits in MAX_PATH below the output folder; the
+    compiled files get a hash suffix (_XXXXXXX.vtex_c), so 20 characters are kept for it."""
+    used = max(len(os.path.abspath(out_root)) + 1, _WIN_PREFIX) if out_root else _WIN_PREFIX
+    return MAX_PATH - used - 20
 
 # Texture slot definitions
 TEXTURE_SLOTS: list[tuple[list[str], str, int]] = [
@@ -80,8 +91,9 @@ def _err(m):  print(f"  ERROR   {m}")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _rnd(n=4):
-    return "".join(random.choices(string.ascii_lowercase, k=n))
+def _rnd(name, n=4):
+    # the same name is always shortened the same way, so a second run writes the same files
+    return hashlib.md5(name.encode("utf-8")).hexdigest()[:n]
 
 
 def _kw_hit(text, kw):
@@ -100,8 +112,9 @@ def detect_surface(name: str) -> str | None:
 def shorten_name(name: str, max_len: int) -> str:
     if len(name) <= max_len:
         return name
-    keep = max(4, max_len - 5)
-    short = name[:keep] + "_" + _rnd(4)
+    stem, ext = os.path.splitext(name)
+    keep = max(4, max_len - len(ext) - 5)
+    short = stem[:keep] + "_" + _rnd(name, 4) + ext
     _warn(f"Name too long, shortened: '{name}' -> '{short}'")
     return short
 
@@ -109,32 +122,19 @@ def shorten_name(name: str, max_len: int) -> str:
 # ---------------------------------------------------------------------------
 # Texture classification
 # ---------------------------------------------------------------------------
+# CS2 Porter: the names are read by texnames (Polyhaven "_diff_1k", Megascans "_1K_BaseColor" ...)
 
 def classify_texture(path: str) -> tuple[str, int, int] | None:
-    base = os.path.splitext(os.path.basename(path))[0].lower()
-    best = None
-    for suffixes, slot, tier in TEXTURE_SLOTS:
-        for suf in suffixes:
-            if base.endswith(suf):
-                suf_len = len(suf)
-                if best is None or tier < best[1] or (tier == best[1] and suf_len > best[2]):
-                    best = (slot, tier, suf_len)
-    return best
+    info = texnames.parse(path)
+    if info is None or info["slot"] == "other":
+        return None
+    return info["slot"], info["tier"], 0
 
 
 def select_slots(textures: list[str]) -> dict[str, str]:
-    candidates: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
-    for tex in textures:
-        r = classify_texture(tex)
-        if r:
-            slot, tier, suf_len = r
-            candidates[slot].append((tier, suf_len, tex))
-
-    selected: dict[str, str] = {}
-    for slot, cands in candidates.items():
-        _, _, best = sorted(cands, key=lambda x: (x[0], -x[1]))[0]
-        selected[slot] = best
-        others = [c[2] for c in cands if c[2] != best]
+    selected = texnames.pick_slots(textures)
+    for slot, best in selected.items():
+        others = [t for t in textures if t != best and (classify_texture(t) or ("",))[0] == slot]
         if others:
             _info(f"Slot conflict '{slot}': picked '{os.path.basename(best)}', "
                   f"skipped: {[os.path.basename(o) for o in others]}")
@@ -208,8 +208,8 @@ def _strip_suffix(stem: str) -> str:
 def group_textures(paths: list[str]) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = defaultdict(list)
     for p in paths:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        root = _strip_suffix(stem) or stem
+        info = texnames.parse(p)
+        root = info["group"] if info else os.path.splitext(os.path.basename(p))[0].lower()
         groups[root].append(p)
     return dict(groups)
 
@@ -482,7 +482,11 @@ def process_group(
 ) -> bool:
     _log(f"\n  Group [{category}] {group_name}")
 
-    mat_dir = os.path.join(out_root, "materials", ASSETS_SUBFOLDER, category, group_name)
+    # the game paths (and the files of the compiled addon) must stay below MAX_PATH
+    budget = game_path_budget(out_root)
+    group_name = shorten_name(group_name, max(8, budget - len(f"materials/{ASSETS_SUBFOLDER}/{category}/")
+                                                - 1 - _TEX_NAME_ROOM))
+    mat_dir = os.path.join(out_root, "materials", *ASSETS_SUBFOLDER.split("/"), category, group_name)
     os.makedirs(mat_dir, exist_ok=True)
 
     slot_map_src = select_slots(textures)
@@ -504,12 +508,16 @@ def process_group(
     game_prefix = f"materials/{ASSETS_SUBFOLDER}/{category}/{group_name}"
 
     opacity_remap: dict[str, str] = {}
+    # file names in the addon: .png for maps that are converted (.exr, DirectX normal ...),
+    # shortened when the path would be too long
+    names = {src: shorten_name(texnames.out_name(src), max(12, budget - len(game_prefix) - 1))
+             for src in slot_map_src.values()}
 
     for slot, src in slot_map_src.items():
-        fname = os.path.basename(src).lower()
+        fname = names[src]
         dst   = os.path.join(mat_dir, fname)
         if not os.path.exists(dst):
-            shutil.copy2(src, dst)
+            texnames.write_texture(src, dst)
 
         if slot == "translucency":
             clf = classify_texture(src)
@@ -524,7 +532,7 @@ def process_group(
 
     slot_map_game: dict[str, str] = {}
     for slot, src in slot_map_src.items():
-        fname = os.path.basename(src).lower()
+        fname = names[src]
         dst   = os.path.join(mat_dir, fname)
         if slot == "translucency":
             grey = opacity_remap.get(dst)

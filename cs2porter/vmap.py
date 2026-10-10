@@ -52,7 +52,7 @@ class Fixes:
                  bhop=False, attributes=None, meshes=None, blends=None, fgd=None, collapse=True,
                  ropes=None, ambients=None, water=None, commands=False, uv_sizes=None,
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
-                 surface_lights=None, underwater=None):
+                 surface_lights=None, underwater=None, sprite_textures=None, decals=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
         self.moondome_vmat = moondome_vmat  # material for the sky brushes (None: tools/toolsskybox)
@@ -79,6 +79,11 @@ class Fixes:
         self.surface_lights = surface_lights or []
         # water .vmat -> underwater .vpost (postfx.write_underwater)
         self.underwater = underwater or {}
+        # sprite material -> its converted texture ('materials/x.tga'): glows draw with it
+        self.sprite_textures = sprite_textures or {}
+        self.glow_particles = {}            # filled by the glow step: vpcf -> texture
+        # infodecals and the faces they sit on (vmf.decal_surfaces)
+        self.decals = decals or []
 
 
 class Result:
@@ -1069,10 +1074,11 @@ def _edit_text(text, fx, table, stats):
     except ValueError:
         pass
     from . import vmap_ents as ents
-    for name, step in (("glows", lambda tx: ents.convert_glows(tx, stats)),
+    for name, step in (("glows", lambda tx: ents.convert_glows(tx, stats, fx.sprite_textures, fx.glow_particles)),
                        ("effects", lambda tx: ents.set_effects(tx, fx.effects, stats)),
                        ("entities", lambda tx: ents.convert_elements(tx, fx, stats)),
-                       ("ambients", lambda tx: ents.set_ambient_events(tx, fx.ambients, stats))):
+                       ("ambients", lambda tx: ents.set_ambient_events(tx, fx.ambients, stats)),
+                       ("decals", lambda tx: ents.place_decals(tx, fx.decals, stats))):
         try:
             text = step(text)
         except (ValueError, IndexError, KeyError) as e:
@@ -1343,6 +1349,8 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
         log(t("vm_blend_fail", e=stats["blend_error"]), "warn")
     if stats["glows"]:
         log(t("vm_glows", n=stats["glows"]), "ok")
+    if stats.get("decals"):
+        log(t("vm_decals", n=stats["decals"]), "ok")
     if stats["beams_found"]:
         log(t("vm_beams", n=stats["beams"], r=stats["beams_removed"]), "warn")
     if stats["unsupported_inputs"]:

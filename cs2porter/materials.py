@@ -508,6 +508,24 @@ Layer0
 """
 
 
+PLACEHOLDER_VMAT = "cs2porter/placeholder"
+# the color of CS2's dev/reflectivity_90b (its texture averages 0.896 linear = 243 sRGB)
+PLACEHOLDER_GRAY = 243
+
+
+def write_placeholder_material(content_dir):
+    """materials/cs2porter/placeholder.vmat: light gray, fully rough (roughness white), for
+    model materials found nowhere (always brought up to date). Returns its name."""
+    from PIL import Image
+    base = os.path.join(content_dir, "materials", *PLACEHOLDER_VMAT.split("/"))
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    Image.new("RGB", (32, 32), (PLACEHOLDER_GRAY,) * 3).save(base + "_color.tga")
+    with open(base + ".vmat", "w", encoding="utf-8") as f:
+        f.write(VC.TMPL_BASIC.format(color=f"materials/{PLACEHOLDER_VMAT}_color.tga",
+                                     sysattr=VC.build_system_attributes("default")))
+    return PLACEHOLDER_VMAT
+
+
 def write_black_material(content_dir):
     """materials/cs2porter/black.vmat (always brought up to date)."""
     path = os.path.join(content_dir, "materials", *BLACK_VMAT.split("/")) + ".vmat"
@@ -543,11 +561,15 @@ def norm_tex(val):
     return v
 
 
+_IMPORT_UNSAFE = str.maketrans({c: "_" for c in " ()'!"})
+
+
 def out_name(rel):
-    """CS2 path rule: lower case and underscores instead of spaces (same as the map importer).
+    """CS2 path rule: lower case and underscores instead of spaces, ( ) ' and ! (the same
+    characters the map importer replaces, so "column (2)" is "column__2_" in both).
     A leading '+' (animated texture names of Source 1, e.g. +0water) is dropped from every part
     of the path, because such names break in CS2; vmap.strip_plus fixes the map's references."""
-    n = rel.lower().replace(" ", "_")
+    n = rel.lower().translate(_IMPORT_UNSAFE)
     if "+" in n:
         n = "/".join(p.lstrip("+") or p for p in n.split("/"))
     return n
@@ -638,6 +660,17 @@ def parse_vmt(data, path, loader=None, _depth=0):
     return VMT(shader, params, path, top)
 
 
+def _fallback_base(vmt):
+    """$basetexture of a fallback block ("lightmappedgeneric_dx6" { ... }) that is a real texture."""
+    if vmt.block is None:
+        return None
+    for sub in vmt.block.blocks():
+        tex = sub.get("$basetexture")
+        if tex and not norm_tex(tex).startswith("_rt_"):
+            return tex
+    return None
+
+
 def _floats(text, scale=1.0):
     if not text:
         return []
@@ -697,6 +730,7 @@ class MaterialConverter:
         self.overwrite = overwrite
         self.convert_cs2_existing = convert_cs2_existing
         self.tex_cache = {}
+        self.sprite_textures = {}       # sprite material -> its texture (glow particles use it)
         self.results = {}
         self.extra_textures = 0
         VC.set_base_dir(content_dir)
@@ -712,23 +746,29 @@ class MaterialConverter:
     def find_vmt(self, mat):
         rel = f"materials/{mat}.vmt"
         src = self.sources.find(rel)
+        if src is None and self.sources.find(f"materials/materials/{mat}.vmt") is not None:
+            # the map named it "materials/<mat>" and packed it under that name
+            rel = f"materials/materials/{mat}.vmt"
+            src = self.sources.find(rel)
         return src, rel
 
     def own_tool(self, mat):
-        """A tools/ material CS2 does not have, packed into the map by its author (custom trigger
-        or light textures): it is converted like any other material."""
+        """A tools/ material that is not one of the special tool materials (toolstrigger,
+        toolsclip ... which CS2 has its own of), like tools/concrete: it is converted like any
+        other material."""
         o = out_name(mat)
         if self.index.in_cs2(f"materials/{o}.vmat_c"):
             return False
-        src = self.sources.find(f"materials/{mat}.vmt")
-        return src is not None and getattr(src, "role", "") == "embedded"
+        if o.rsplit("/", 1)[-1].startswith("tools"):
+            return False
+        return self.sources.find(f"materials/{mat}.vmt") is not None
 
     def material_available(self, mat):
         """Is the material in the target / in CS2, or can it be found in a source?"""
         o = out_name(mat)
         if self.index.in_addon(f"materials/{o}.vmat") or self.index.in_cs2(f"materials/{o}.vmat_c"):
             return True
-        return self.sources.find(f"materials/{mat}.vmt") is not None
+        return self.find_vmt(mat)[0] is not None
 
     # --- textures ---------------------------------------------------------------
     def ensure_texture(self, tex):
@@ -919,6 +959,12 @@ class MaterialConverter:
             return self._write_refract(mat, vmt, src.label)
 
         base = vmt.get("$basetexture") or vmt.get("$hdrbasetexture")
+        if base and norm_tex(base).startswith("_rt_"):
+            # a render target (a camera screen ...) does not exist in CS2: the material's own
+            # stand-in texture is used, the one Source 1 shows in the editor and on old cards
+            base = vmt.get("%tooltexture") or _fallback_base(vmt)
+            if not base:
+                return MaterialResult(mat, "unsupported", t("m_render_target"), src.label)
         env = (vmt.get("$envmap") or "").strip().lower()
         if not base and env and env != "env_cubemap":
             # only a cubemap: the surface shows that sky
@@ -1190,6 +1236,8 @@ class MaterialConverter:
         o = out_name(mat)
         vmat_abs = self._abs(f"materials/{o}.vmat")
         shader = vmt.shader
+        if "sprite" in usages and color and not color.startswith("["):
+            self.sprite_textures[mat] = color
         surface = map_surface(vmt.get("$surfaceprop"))
         sysattr = VC.build_system_attributes(surface)
         normal_path = normal or DEFAULT_NORMAL
@@ -1242,7 +1290,17 @@ class MaterialConverter:
                 tint=f"[{tint[0]:.6f} {tint[1]:.6f} {tint[2]:.6f} 0.000000]", sysattr=sysattr)
             tag = "self illum"
         else:
-            transparent, trans = self._translucency(color, vmt, decide_by_pixels=not is_model or is_foliage or is_decal or is_glass)
+            # Source 1 only blends a world or model material when its VMT asks for it
+            # ($translucent / $alphatest); decals and foliage go by their alpha
+            transparent, trans = self._translucency(color, vmt, decide_by_pixels=is_foliage or is_decal)
+            if vmt.flag("$additive") and not (is_unlit or is_decal or is_foliage or is_glass):
+                # a lit $additive surface (laser beams, light shafts) adds its texture to what
+                # is behind it: it becomes a translucent layer, as opaque as it is bright
+                tint = list(vmt_color(vmt) or (1.0, 1.0, 1.0)) if not _proxy_writes(vmt, "$color") else [1.0] * 3
+                layers = self._additive_layers(color, trans if transparent else None, tint)
+                if layers:
+                    color, trans = layers
+                    transparent = True
             if is_foliage and (transparent or vmt.flag("$alphatest") or vmt.flag("$translucent")):
                 slot = {"TextureLayer1Color": color, "TextureLayer1Normal": normal_path}
                 if transparent and trans:

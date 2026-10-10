@@ -109,7 +109,21 @@ def rename_inputs(text, names, mapping, stats=None, unsupported=()):
 # glow sprites
 # ---------------------------------------------------------------------------
 
-def convert_glows(text, stats):
+def glow_vpcf(mat):
+    """Glow particle that draws with the texture of the sprite material mat."""
+    return f"particles/cs2porter/glow_{re.sub(r'[^a-z0-9_]+', '_', out_name(mat).lower()).strip('_')}.vpcf"
+
+
+def _sprite_material(name):
+    n = (name or "").strip().replace("\\", "/").lower()
+    if n.startswith("materials/"):
+        n = n[len("materials/"):]
+    return n[:-4] if n.endswith((".vmt", ".spr")) else n
+
+
+def convert_glows(text, stats, sprite_textures=None, glow_particles=None):
+    """sprite_textures: {sprite material: texture}; glow_particles receives {vpcf: texture} for
+    the glows that got a particle drawing with their own sprite texture."""
     if '"env_particle_glow"' not in text:
         return text
     names = set()
@@ -123,7 +137,13 @@ def convert_glows(text, stats):
         alpha = _float(p.get("alphascale"), 1.0)
         scale = _float(p.get("scale"), 1.0)
         illum = _float(p.get("selfillumscale"), 1.0)
-        return {"classname": "info_particle_system", "effect_name": GLOW_VPCF,
+        effect = GLOW_VPCF
+        mat = _sprite_material(p.get("s1 env_sprite material"))
+        if sprite_textures and mat in sprite_textures:
+            effect = glow_vpcf(mat)
+            if glow_particles is not None:
+                glow_particles[effect] = sprite_textures[mat]
+        return {"classname": "info_particle_system", "effect_name": effect,
                 "start_active": p.get("start_active") or "1",
                 "data_cp": "1", "data_cp_value": f"{_num(alpha)} {_num(scale)} {_num(illum)}",
                 "tint_cp": "2", "tint_cp_color": p.get("colortint") or "255 255 255",
@@ -243,6 +263,100 @@ def _own_origin(e):
 
 def _vfmt(v):
     return " ".join(_num(c) for c in v)
+
+
+# ---------------------------------------------------------------------------
+# infodecal quads back onto their surface
+# ---------------------------------------------------------------------------
+
+# the importer puts the quad of an infodecal this far in front of the face it picked
+DECAL_LIFT = 16.0
+_FACES_RE = re.compile(r'"faceEdgeIndices" "int_array"\s*\[([^\]]*)\]')
+
+
+def _up_vector(angles):
+    """Where the element's +Z points (Source angles: pitch, yaw, roll)."""
+    p, y, r = (math.radians(a) for a in angles)
+    sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(r), math.cos(r)
+    return (cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp)
+
+
+def _angles_for(n, old):
+    """Angles (pitch 0) that turn +Z to n; a floor or ceiling keeps the old yaw."""
+    roll = math.degrees(math.acos(max(-1.0, min(1.0, n[2]))))
+    yaw = old[1] if math.hypot(n[0], n[1]) < 1e-3 else math.degrees(math.atan2(n[0], -n[1]))
+    return (0.0, yaw, roll)
+
+
+def _replace_last(e, regex, value):
+    found = list(regex.finditer(e))
+    if not found:
+        return e
+    m = found[-1]
+    return e[:m.start(1)] + value + e[m.end(1):]
+
+
+def place_decals(text, decals, stats):
+    """decals: vmf.decal_surfaces(). Each infodecal's quad (a one face overlay with its material,
+    DECAL_LIFT units from the decal) is put onto the decal's surface, facing out of it."""
+    if not decals:
+        return text
+    by_mat = {}
+    for point, mat, normal, origin in decals:
+        by_mat.setdefault(f"materials/{out_name(mat)}.vmat", []).append([point, normal, origin, False])
+
+    def fn(e):
+        if not e.lstrip().startswith(('"CMapStaticOverlay"', '"CMapMesh"')):
+            return None
+        m = _MATS_RE.search(e)
+        mats = [x.lower() for x in re.findall(r'"([^"]*)"', m.group(1))] if m else []
+        if len(mats) != 1 or mats[0] not in by_mat:
+            return None
+        faces = _FACES_RE.search(e)
+        if not faces or len(re.findall(r'"\d+"', faces.group(1))) != 1:
+            return None
+        q = _own_origin(e)
+        if q is None:
+            return None
+        cands = [d for d in by_mat[mats[0]] if not d[3]]
+        if not cands:
+            return None
+        d = min(cands, key=lambda c: abs(math.dist(q, c[2]) - DECAL_LIFT))
+        if abs(math.dist(q, d[2]) - DECAL_LIFT) > 1.5:
+            return None
+        d[3] = True
+        point, normal = d[0], d[1]
+        ang = _ANGLES_RE.findall(e)
+        try:
+            old = tuple(float(v) for v in ang[-1].split()) if ang else (0.0, 0.0, 0.0)
+        except ValueError:
+            old = (0.0, 0.0, 0.0)
+        e = _replace_last(e, _ORIGIN_RE, _vfmt(point))
+        if normal is not None:
+            up = _up_vector(old)
+            if sum(up[k] * normal[k] for k in range(3)) < 0.999:
+                e = _replace_last(e, _ANGLES_RE, _vfmt(_angles_for(normal, old)))
+        stats["decals"] = stats.get("decals", 0) + 1
+        return [e]
+
+    try:
+        text, _ch = transform_world(text, fn)
+    except ValueError:
+        pass                # a file without a world: only its top level elements
+    # the importer writes these overlays at the top of the file, the world only names their id
+    from .vmap import _ROOT_ELEM_RE, _close
+    out, pos = [], 0
+    for m in _ROOT_ELEM_RE.finditer(text):
+        if m.group(1) not in ('"CMapStaticOverlay"', '"CMapMesh"') or m.start() < pos:
+            continue
+        end = _close(text, text.find("{", m.end() - 1))
+        new = fn(text[m.start() + 1:end])
+        if new:
+            out += [text[pos:m.start() + 1], new[0]]
+            pos = end
+    if out:
+        text = "".join(out) + text[pos:]
+    return text
 
 
 # Source 1 rope physics (rope_shared.h, rope_physics.cpp, c_rope.cpp): spring length =
@@ -555,15 +669,27 @@ def _lower_top(mesh, depth):
         return None
     if not verts or any(len(v) != 3 for v in verts):
         return None
-    zs = [v[2] for v in verts]
-    top = max(zs) - depth
-    if top - min(zs) < UNDERWATER_MIN_HEIGHT:
-        return None
-    it = iter(verts)
+    # every column of corners (same x, y) gets its top corner lowered, so a sloped or uneven
+    # surface stays the same shape (cutting at one height would fold its faces onto each other)
+    cols = {}
+    for i, (x, y, _z) in enumerate(verts):
+        cols.setdefault((round(x, 1), round(y, 1)), []).append(i)
+    new_z = [v[2] for v in verts]
+    for idx in cols.values():
+        zs = [verts[i][2] for i in idx]
+        top, bottom = max(zs), min(zs)
+        if len(idx) < 2 or top - depth - bottom < UNDERWATER_MIN_HEIGHT:
+            return None
+        for i in idx:
+            if verts[i][2] > top - 0.05:
+                new_z[i] = top - depth
+            elif verts[i][2] > top - depth:
+                return None     # a corner between the old and the new top
+    it = iter(zip(verts, new_z))
 
     def lowered(_m):
-        x, y, z = next(it)
-        return f'"{_num(x)} {_num(y)} {_num(min(z, top))}"'
+        (x, y, _z), z = next(it)
+        return f'"{_num(x)} {_num(y)} {_num(z)}"'
 
     return mesh[:m.start(1)] + re.sub(r'"[^"]*"', lowered, m.group(1)) + mesh[m.end(1):]
 
