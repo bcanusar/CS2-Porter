@@ -219,6 +219,30 @@ def load_vtf(data):
     return _decode(fmt, w, h, raw), info
 
 
+def load_vtf_mips(data):
+    """Every mip level of the VTF (first frame / face / slice), largest first, as Pillow images."""
+    info = read_header(data)
+    fmt = info.format
+    if fmt < 0:
+        raise VTFError("No image data")
+    w, h = info.width, info.height
+    faces = _faces(info)
+    sizes = [_image_size(fmt, max(1, w >> m), max(1, h >> m)) * info.frames * faces * max(1, info.depth >> m)
+             for m in range(info.mips)]
+    off = _hi_res_offset(data, info)
+    out = []
+    for m in range(info.mips):
+        # mips are stored small to large
+        start = off + sum(sizes[m + 1:])
+        mw, mh = max(1, w >> m), max(1, h >> m)
+        size = _image_size(fmt, mw, mh)
+        raw = data[start: start + size]
+        if len(raw) < size:
+            break
+        out.append(_decode(fmt, mw, mh, raw))
+    return out
+
+
 CUBE_FACE_NAMES = ("rt", "lf", "bk", "ft", "up", "dn")
 
 

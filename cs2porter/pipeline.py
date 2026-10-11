@@ -1,6 +1,7 @@
 """Map porting and missing asset workflows."""
 
 import collections
+import copy
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ from . import particles as particlesmod
 from . import postfx as postfxmod
 from . import probes as probesmod
 from . import s1stub
+from . import sky3d as sky3dmod
 from . import sounds as soundsmod
 from . import texlights as texlightsmod
 from . import uvfix
@@ -28,7 +30,7 @@ from . import materials as materialsmod
 from .materials import (BLACK_MATERIALS, BROKEN_CABLE_MATERIALS, MaterialConverter, out_name,
                         write_black_material, write_cable_fallback)
 from .models import ModelConverter, QCIndex, norm_model
-from .skybox import MOONDOME_VMAT, SKY_VMAT, build_skybox
+from .skybox import MOONDOME_VMAT, SKY_VMAT, build_skybox, suns_of
 from .sources import AssetSources, CS2Index, DirSource, VPKSource
 from .vpk import VPKArchive, VPKError
 from .valve_tools import Cancelled, ToolError, ValveTools, decompile_bsp
@@ -154,6 +156,8 @@ class Report:
         self.notices = []           # things the user must know when the job ends (shown in a box)
         self.input_path = ""
         self.extra_path = ""
+        self.from_bsp = False
+        self.pak_damaged = set()    # files of the map's pakfile that could not be read
 
     def counts(self, which):
         d = self.materials if which == "materials" else self.models
@@ -460,6 +464,14 @@ def open_sources(cfg, ctx, embedded_dir=None, extra_dirs=(), prefer=None):
     return sources
 
 
+def pak_note(report, rel):
+    """Why a file of a ported .bsp was not found: the map did not pack it, or packed it but that
+    copy is damaged. Empty when the input was not a .bsp."""
+    if not report.from_bsp:
+        return ""
+    return t("m_pak_damaged" if rel.lower() in report.pak_damaged else "m_not_packed")
+
+
 def _is_tool(mat):
     # tools/* (toolstrigger, toolsskybox, toolsplayerclip, toolsinvisible-dx10 ...) already exist in CS2
     return mat.replace("\\", "/").lower().startswith("tools/")
@@ -512,6 +524,8 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
         for mdl in sorted(models):
             ctx.check()
             r = modelconv.convert(mdl)
+            if r.status == "missing" and r.detail == t("md_missing"):
+                r.detail += pak_note(report, r.mdl)
             report.models[r.mdl] = r
             ctx.result("model", r.mdl, r.status, r.detail, r.source)
             tag = {"created": "ok", "missing": "warn", "error": "err"}.get(r.status, "dim")
@@ -533,6 +547,12 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
             ctx.check()
             r = matconv.convert(mat, mats[mat])
             report.materials[r.mat] = r
+            tex_head = t("m_tex_missing", tex="\0").split("\0")
+            if r.status == "missing" and r.detail == t("m_no_vmt"):
+                r.detail += pak_note(report, f"materials/{r.mat}.vmt")
+            elif r.status == "missing" and r.detail.startswith(tex_head[0]) and r.detail.endswith(tex_head[1]):
+                tex = r.detail[len(tex_head[0]):len(r.detail) - len(tex_head[1])]
+                r.detail += pak_note(report, f"materials/{tex}.vtf")
             ctx.result("material", r.mat, r.status, r.detail, r.source)
             tag = {"created": "ok", "missing": "warn", "error": "err", "unsupported": "warn"}.get(r.status, "dim")
             if r.status not in ("cs2", "exists", "tool"):
@@ -549,13 +569,14 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
         ctx.log(t("p_tools_skipped", n=len(tools_skipped)), "dim")
 
 
-def make_skybox(cfg, ctx, report, sources, content_dir, skyname):
+def make_skybox(cfg, ctx, report, sources, content_dir, skyname, suns=None, sky_angles=None):
     """Builds skybox.png / skybox.vmat (and skybox_moondome.vmat when the sky brushes use it).
     True if they can be used."""
     ctx.check()
     st, detail = build_skybox(sources, content_dir, skyname, config.VTFCMD,
                               cfg["opts"].get("overwrite", False), ctx.log,
-                              moondome=bool(cfg["opts"].get("sky_moondome", True)))
+                              moondome=bool(cfg["opts"].get("sky_moondome", True)), suns=suns,
+                              sky_angles=sky_angles)
     report.skybox = f"{skyname}: {t_en('st_' + st)} ({detail})"
     ctx.result("skybox", SKY_VMAT, st, detail, "")
     ctx.log(t("p_skybox", sky=skyname, status=status_text(st), detail=detail),
@@ -565,7 +586,7 @@ def make_skybox(cfg, ctx, report, sources, content_dir, skyname):
     return st in ("created", "exists")
 
 
-def make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients=(), map_name=""):
+def make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients=(), map_name="", report=None):
     """Copies the map's sounds (44100 Hz) and adds its soundscapes and one soundevent per
     ambient_generic sound to soundevents_addon.vsndevts. Returns {position: event name} for the
     ambient_generics."""
@@ -574,8 +595,13 @@ def make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients=(
     if not files:
         return {}
     ctx.log(t("p_sounds", n=len(files), s=len(scapes)), "head")
+
+    def result(kind, name, st, detail, source):
+        if st == "missing" and not detail and report is not None:
+            detail = pak_note(report, name).strip()
+        ctx.result(kind, name, st, detail, source)
     found = soundsmod.copy_sounds(files, sources, content_dir, cfg["opts"].get("overwrite", False),
-                                  ctx.result, ctx.log)
+                                  result, ctx.log)
     blocks, names = soundsmod.soundscape_events(scapes, found)
     amb_blocks, table = soundsmod.ambient_events(ambients, found, map_name or bsp_name)
     if blocks or amb_blocks:
@@ -805,9 +831,16 @@ def write_glow_particles(ctx, content_dir, glows):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             text = re.sub(r'm_hTexture = resource:"[^"]*"', f'm_hTexture = resource:"{vtex}"', base)
             # a Source 1 sprite is as many units wide as its texture has pixels (times its scale)
-            size = _image_size(os.path.join(content_dir, *tex.split("/")))
+            tex_abs = os.path.join(content_dir, *tex.split("/"))
+            size = _image_size(tex_abs)
             if size:
                 text = text.replace("m_flLiteralValue = 48.0", f"m_flLiteralValue = {max(size) / 2.0:.1f}", 1)
+            if not materialsmod.MaterialConverter._alpha_used(tex_abs):
+                # a glow texture without alpha (black around the glow) is added to what is
+                # behind it, like the additive / glow render modes of Source 1 sprites
+                text = text.replace("\t\t\tm_bSaturateColorPreAlphaBlend = false",
+                                    '\t\t\tm_nOutputBlendMode = "PARTICLE_OUTPUT_BLEND_MODE_ADD"\n'
+                                    "\t\t\tm_bSaturateColorPreAlphaBlend = false", 1)
             with open(dst, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             ctx.log(t("p_particle", f=rel), "ok")
@@ -946,16 +979,17 @@ _VMDL_REF_RE = re.compile(r'(\b(?:to|global_default_material)\s*=\s*)"([^"]+\.vm
                           r'([ \t]*// cs2porter placeholder for (\S+\.vmat))?', re.I)
 
 
-def model_placeholders(cfg, ctx, content_dir, game_dir):
+def model_placeholders(cfg, ctx, content_dir, game_dir, only=None):
     """Puts PLACEHOLDER_VMAT into the remaps of the addon's models whose material is neither in
     the addon nor in CS2 (and the real material back once it is there). Every model that uses a
-    placeholder gets a warning row."""
+    placeholder gets a warning row; with `only` (lower case .vmdl paths relative to content_dir)
+    just those models are reported, the others are still kept up to date quietly."""
     base = os.path.join(content_dir, "models")
     if not os.path.isdir(base):
         return
     on = bool(cfg["opts"].get("model_placeholder", True))
     index = None
-    placed = 0
+    placed = shown = 0
     for dp, _dn, fn in os.walk(base):
         for f in fn:
             if not f.lower().endswith(".vmdl"):
@@ -994,15 +1028,19 @@ def model_placeholders(cfg, ctx, content_dir, game_dir):
                     fh.write(new)
             if not hits:
                 continue
-            rel = os.path.relpath(path, content_dir).replace("\\", "/")
-            names = sorted({h[len("materials/"):-len(".vmat")] for h in hits})
             placed += 1
+            rel = os.path.relpath(path, content_dir).replace("\\", "/")
+            if only is not None and rel.lower() not in only:
+                continue
+            shown += 1
+            names = sorted({h[len("materials/"):-len(".vmat")] for h in hits})
             ctx.log(t("p_placeholder", model=rel, mats=", ".join(names)), "warn")
             for name in names:
-                ctx.result("model", rel, "placeholder", t("m_placeholder", mat=name), "")
+                ctx.result("model", rel, "warning", t("m_placeholder", mat=name), "")
     if placed:
         materialsmod.write_placeholder_material(content_dir)
-        ctx.log(t("p_placeholder_sum", n=placed, mat=PLACEHOLDER_VMAT), "warn")
+    if shown:
+        ctx.log(t("p_placeholder_sum", n=shown, mat=PLACEHOLDER_VMAT), "warn")
 
 
 def compile_assets(cfg, ctx, valve, content_dir, game_dir, work):
@@ -1115,6 +1153,29 @@ def _tracer(info, root):
         return None
 
 
+def _mip_fades(ctx, sources, vinfo, vmf_path, meshes):
+    """Brush textures that vanish with distance in Source 1 by their own lower mips
+    (materials.mip_fade) get faces that fade out (vmf.fade_faces). The textures are only known
+    once the sources are open, so the written .vmf is read and written again when there are any."""
+    fades = {}
+    for mat, uses in vinfo.materials.items():
+        if uses & {"brush", "brushent"}:
+            levels = materialsmod.mip_fade(sources, mat)
+            if levels:
+                fades[mat] = levels
+    if not fades:
+        return
+    try:
+        root = vmfmod.parse_vmf(vmf_path)
+        faces, tiles = vmfmod.fade_faces(root, fades, meshes)
+        if faces:
+            vmfmod.write_vmf(root, vmf_path)
+    except Exception as e:  # noqa: BLE001 - the faces stay as they are
+        ctx.log(t("p_mip_fade_fail", e=e), "warn")
+        return
+    ctx.log(t("p_mip_fade", mats=", ".join(sorted(fades)), n=faces, k=tiles), "info")
+
+
 def _light_setup(ctx, opts, root, info, tracer):
     """Lights for the .vmap fixes, the bounds of the map (for the visibility_hint) and the light
     probe volumes with their rooms. info: the .bsp (None for a .vmf input)."""
@@ -1128,8 +1189,13 @@ def _light_setup(ctx, opts, root, info, tracer):
         if rooms:
             voxels = sum((hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]) for lo, hi, _r in rooms) / 108.0 ** 3
             ctx.detail(t("d_light_rooms", n=len(rooms), rooms=sum(1 for r in rooms if r[2]), k=round(voxels / 1000)))
+    return _lights_of(ctx, opts, root, info, tracer), bounds, rooms
+
+
+def _lights_of(ctx, opts, root, info, tracer):
+    """Lights of the map for the .vmap fixes (vmf.collect_lights)."""
     if not opts.get("fix_light_brightness", True):
-        return vmfmod.collect_lights(root), bounds, rooms
+        return vmfmod.collect_lights(root)
     try:
         values = lightingmod.light_values(root, info if tracer is not None else None, tracer)
     except Exception:  # noqa: BLE001
@@ -1137,7 +1203,61 @@ def _light_setup(ctx, opts, root, info, tracer):
     if values:
         lum = sorted(v["lumens"] * v.get("cone", 1.0) for v in values.values())
         ctx.detail(t("d_light_lumens", n=len(lum), lo=lum[0], mid=lum[len(lum) // 2], hi=lum[-1]))
-    return vmfmod.collect_lights(root, values), bounds, rooms
+    return vmfmod.collect_lights(root, values)
+
+
+def _sky3d_vmap(ctx, valve, work, maps_dir, sources, fx, res, sky3d, tex_lights):
+    """The .vmap fixes of the skybox map (the main map's, with its own lights, decals ...), then
+    it moves onto the origin and becomes a 3D skybox. Its stats are added to res."""
+    ctx.log(t("p_sky3d_vmap", map=sky3d.name), "head")
+    sfx = copy.copy(fx)
+    sfx.lights, sfx.decals, sfx.ropes = sky3d.lights or [], sky3d.decals or [], sky3d.ropes or {}
+    sfx.blends = blendmod.only_blends(sky3d.disps, sources) if sky3d.disps else {}
+    sfx.surface_lights = _surface_lights(ctx, sources, sky3d.glow_rects, tex_lights) or []
+    sfx.vis_bounds = sfx.light_rooms = sfx.skybox_ref = None
+    sfx.commands = False
+    room = sky3d.room
+    sfx.sky_map = {"offset": tuple(-v for v in room.camera), "box": (room.lo, room.hi)}
+    sres = vmapmod.post_process(valve, work, maps_dir, sky3d.name, sfx, ctx.log)
+    for k, v in sres.stats.items():
+        if isinstance(v, int) and not isinstance(v, bool):
+            res.stats[k] = res.stats.get(k, 0) + v
+    res.bhop_outputs += sres.bhop_outputs
+    if sres.stats.get("sky_moved"):
+        ctx.log(t("p_sky3d_done", map=sky3d.name), "ok")
+
+
+class _Sky3D:
+    """The 3D skybox room of a map, taken out of it as a map of its own (sky3d.py), and what its
+    .vmap fixes need."""
+
+    def __init__(self, name, root, room):
+        self.name, self.root, self.room = name, root, room
+        self.lights = self.decals = self.glow_rects = self.ropes = self.disps = None
+        self.imported = False
+
+
+def _split_sky3d(ctx, opts, root, info, tracer, map_name):
+    """Takes the sky_camera's room out of root (see sky3d.py). None when the map has no 3D
+    skybox, the option is off or the room can not be told apart."""
+    if not opts.get("sky3d", True) or not any(e.classname == "sky_camera" for e in root.children("entity")):
+        return None
+    if info is None or tracer is None:
+        ctx.log(t("p_sky3d_no_bsp"), "dim")
+        return None
+    try:
+        room = sky3dmod.find_room(root, info, tracer)
+        if room is None:
+            ctx.log(t("p_sky3d_no_room"), "warn")
+            return None
+        sky_root, counts = sky3dmod.split(root, info, tracer, room)
+    except Exception as e:  # noqa: BLE001 - the room stays in the map
+        ctx.log(t("p_sky3d_fail", e=e), "warn")
+        return None
+    name = sky3dmod.sky_map_name(map_name)
+    ctx.log(t("p_sky3d", map=name, brushes=counts["brushes"], ents=counts["entities"],
+              scale=_num_text(room.scale)), "ok")
+    return _Sky3D(name, sky_root, room)
 
 
 _ADDON_MAKE_LOCK = threading.Lock()
@@ -1211,8 +1331,9 @@ def port_map(cfg, ctx, input_path, addon_name):
         info = bspmod.BSPInfo(input_path)
         ctx.log(t("p_bsp_version", ver=info.version, game=info.game_guess), "info")
         ctx.log(t("p_extract"), "head")
+        report.from_bsp = True
         try:
-            bspmod.extract_pakfile(input_path, embedded_dir, smart=True, log=ctx.log)
+            bspmod.extract_pakfile(input_path, embedded_dir, smart=True, log=ctx.log, damaged=report.pak_damaged)
         except Exception as e:  # noqa: BLE001
             ctx.log(t("p_extract_fail", e=e), "warn")
         _detail_files(ctx, embedded_dir, "d_extracted")
@@ -1261,7 +1382,12 @@ def port_map(cfg, ctx, input_path, addon_name):
     # toolsskybox faces get a stand-in material for the import (see vmf.pick_sky_alias)
     sky_alias = vmfmod.pick_sky_alias(vinfo.materials) if vmfmod.has_sky_faces(vinfo.materials) else None
     tracer = _tracer(None if is_vmf else info, root)
+    # the 3D skybox room becomes a map of its own (before the light setup: the light probe
+    # volumes and white rooms are only planned for what is left)
+    sky3d = _split_sky3d(ctx, opts, root, None if is_vmf else info, tracer, map_name)
     lights, vis_bounds, light_rooms = _light_setup(ctx, opts, root, None if is_vmf else info, tracer)
+    if sky3d:
+        sky3d.lights = _lights_of(ctx, opts, sky3d.root, info, tracer)
     if light_rooms and sky_alias:
         # the white rooms are wrapped in sky brushes (moondome) so they look like the sky
         shells = vmfmod.add_room_shells(root, light_rooms, probesmod.ROOM_HALF, vmfmod.SKYBOX_MAT)
@@ -1274,22 +1400,43 @@ def port_map(cfg, ctx, input_path, addon_name):
     attributes, meshes, effects = {}, {}, {}
     # the faces the infodecals sit on (the importer places their quads in front of them)
     decals = vmfmod.decal_surfaces(root)
-    vmfmod.fix_for_cs2(root, sky_alias=sky_alias, attributes=attributes, meshes=meshes,
-                       teleport_key=vmapmod.TELEPORT_KEY if bhop_on else None,
-                       split_triggers=bool(opts.get("split_triggers", True)), effects=effects, log=ctx.log,
-                       bhop_blocks=blocks, world=tracer)
+    roots = [root] + ([sky3d.root] if sky3d else [])
+    if sky3d:
+        sky3d.decals = vmfmod.decal_surfaces(sky3d.root)
+    # env_sun is drawn into the sky texture (CS2 has no sun sprite) and left out of the map
+    suns = []
+    if opts.get("sun_in_sky", True) and any(e.classname == "env_sun" for r in roots for e in r.children("entity")):
+        suns = suns_of([{i[0].lower(): i[1] for i in e.items if isinstance(i, list)}
+                        for r in roots for e in r.children("entity")])
+        for r in roots:
+            r.items = [i for i in r.items if not (isinstance(i, vmfmod.VNode) and i.name.lower() == "entity"
+                                                  and i.classname == "env_sun")]
+    for r in roots:
+        vmfmod.fix_for_cs2(r, sky_alias=sky_alias, attributes=attributes, meshes=meshes,
+                           teleport_key=vmapmod.TELEPORT_KEY if bhop_on else None,
+                           split_triggers=bool(opts.get("split_triggers", True)), effects=effects,
+                           log=ctx.log if r is root else None, bhop_blocks=blocks, world=tracer)
     del tracer
     vmfmod.write_vmf(root, vmf_path)
+    if sky3d:
+        vmfmod.write_vmf(sky3d.root, os.path.join(os.path.dirname(vmf_path), f"{sky3d.name}.vmf"))
     # texture lights, and the faces of the ones that may need lights in front of them (water)
     tex_lights = {} if is_vmf else _texture_lights(ctx, info)
     glow_rects = vmfmod.surface_rects(root, set(tex_lights)) if tex_lights else []
     color_corrections = _color_corrections(root)
-    ent_sounds = soundsmod.entity_sounds(root)
-    ambients = soundsmod.collect_ambients(root)
-    wanted_particles = particlesmod.wanted_systems(root)
+    ent_sounds, ambients, wanted_particles = [], [], {}
+    for r in roots:
+        ent_sounds += [s for s in soundsmod.entity_sounds(r) if s not in ent_sounds]
+        ambients += soundsmod.collect_ambients(r)
+        wanted_particles.update(particlesmod.wanted_systems(r))
     ropes = vmfmod.collect_ropes(root)
     disps = blendmod.collect_disps(root)
-    del root
+    if sky3d:
+        sky3d.glow_rects = vmfmod.surface_rects(sky3d.root, set(tex_lights)) if tex_lights else []
+        sky3d.ropes = vmfmod.collect_ropes(sky3d.root)
+        sky3d.disps = blendmod.collect_disps(sky3d.root)
+        sky3d.root = None
+    del root, roots
     ctx.check()
 
     materials = {k: set(v) for k, v in vinfo.materials.items()}
@@ -1299,17 +1446,27 @@ def port_map(cfg, ctx, input_path, addon_name):
     _hold_addon(ctx)
     sources = open_sources(cfg, ctx, embedded_dir if os.path.isdir(embedded_dir) else None, prefer=prefer)
     try:
+        if opts.get("mip_fade", True):
+            _mip_fades(ctx, sources, vinfo, vmf_path, meshes)
+        ctx.check()
         # --- 3) map geometry (import) ---------------------------------------
         ctx.progress(0.2, t("pr_import"))
         aliases = {sky_alias: vmfmod.SKYBOX_MAT} if sky_alias else None
-        refs = _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
-                           vinfo.skyname, map_name, addon, cs2_ok, aliases)
+        refs, imported = _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
+                                     vinfo.skyname, map_name, addon, cs2_ok, aliases,
+                                     extra=(sky3d.name,) if sky3d else ())
+        if sky3d:
+            sky3d.imported = sky3d.name in imported
         ctx.check()
 
         # --- 3b) skybox, sounds and soundscapes --------------------------------------------
-        sky_ok = make_skybox(cfg, ctx, report, sources, content_dir, vinfo.skyname) if vinfo.skyname else False
+        # the sun goes where the imported map's env_sky shows its direction
+        sky_angles = vmapmod.env_sky_angles(os.path.join(cfg["cs2_dir"], "content", "csgo_addons", addon, "maps",
+                                                         f"{map_name}.vmap")) if suns else None
+        sky_ok = make_skybox(cfg, ctx, report, sources, content_dir, vinfo.skyname, suns,
+                             sky_angles) if vinfo.skyname else False
         bsp_name = os.path.splitext(os.path.basename(input_path))[0]
-        ambient_table = make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients, map_name)
+        ambient_table = make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients, map_name, report)
         particle_names = make_particles(cfg, ctx, valve if cs2_ok else None, sources, work, content_dir,
                                         embedded_dir if os.path.isdir(embedded_dir) else None, addon,
                                         wanted_particles)
@@ -1317,12 +1474,17 @@ def port_map(cfg, ctx, input_path, addon_name):
 
         # --- 4) assets from the refs.txt list are added too --------------------------------
         if refs:
-            m1, m2 = read_reference_file(refs)
-            # the importer's list is only read here, it does not belong in the addon
-            try:
-                os.remove(refs)
-            except OSError:
-                pass
+            m1, m2 = {}, {}
+            for path in refs:
+                a, b = read_reference_file(path)
+                for k, v in a.items():
+                    m1.setdefault(k, set()).update(v)
+                m2.update(b)
+                # the importer's list is only read here, it does not belong in the addon
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             # skybox faces listed for env_sky are not made into materials (handled in the skybox step)
             if vinfo.skyname:
                 sky = vinfo.skyname.lower()
@@ -1355,7 +1517,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             ctx.progress(0.86, t("pr_vmap"))
             ctx.log(t("p_vmap"), "head")
             maps_dir = os.path.join(cfg["cs2_dir"], "content", "csgo_addons", addon, "maps")
-            cable_missing = missing_rope_materials(report, ropes)
+            cable_missing = missing_rope_materials(report, dict(ropes, **(sky3d.ropes if sky3d else {})))
             if cable_missing:
                 write_cable_fallback(content_dir, opts.get("overwrite", False))
             water_set = water_vmats(sources, materials)
@@ -1372,8 +1534,11 @@ def port_map(cfg, ctx, input_path, addon_name):
                                uv_sizes=uvfix.TextureSizes(content_dir),
                                effects=effects, cable_missing=cable_missing, vis_bounds=vis_bounds,
                                light_rooms=light_rooms, particle_names=particle_names,
-                               sprite_textures=report.sprite_textures, decals=decals)
+                               sprite_textures=report.sprite_textures, decals=decals,
+                               skybox_ref=f"maps/{sky3d.name}.vmap" if sky3d and sky3d.imported else None)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
+            if sky3d and sky3d.imported:
+                _sky3d_vmap(ctx, valve, work, maps_dir, sources, fx, res, sky3d, tex_lights)
             write_glow_particles(ctx, content_dir, fx.glow_particles)
             if res.stats.get("black"):
                 # black faces (also the ones the import itself gives a black material)
@@ -1399,7 +1564,9 @@ def port_map(cfg, ctx, input_path, addon_name):
         sources.close()
     ctx.check()
     if cs2_ok:
-        model_placeholders(cfg, ctx, content_dir, game_dir)
+        # only this map's models are reported (the addon's other maps' models are not its business)
+        model_placeholders(cfg, ctx, content_dir, game_dir,
+                           only={(out_name(m[:-4]) + ".vmdl").lower() for m in report.models})
         compile_assets(cfg, ctx, valve, content_dir, game_dir, work)
     for note in report.notices:
         ctx.log(note, "warn")
@@ -1570,46 +1737,54 @@ def _beam_notice(report, stats):
 
 
 def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials, skyname,
-                map_name, addon, cs2_ok, aliases=None):
-    """Imports the map as a .vmap. Returns the path of the new _refs.txt (or None)."""
+                map_name, addon, cs2_ok, aliases=None, extra=()):
+    """Imports the map as a .vmap, then the extra maps of the same folder (the 3D skybox).
+    Returns ([paths of the new _refs.txt files], {names of the maps imported})."""
     if not cs2_ok:
         ctx.log(t("p_import_skip_cs2"), "warn")
-        return None
+        return [], set()
     if not valve.has_source1import:
         ctx.log(t("p_import_skip_tools"), "warn")
         report.import_ok = False
-        return None
+        return [], set()
     if " " in content_root:
         ctx.log(t("p_import_space"), "err")
         report.import_ok = False
-        return None
+        return [], set()
 
     ctx.log(t("p_import"), "head")
     gi, n = s1stub.build_stub_game(work, sources, sorted(materials), skyname, aliases)
     ctx.log(t("p_stub", n=n), "dim")
     maps_dir = os.path.join(cfg["cs2_dir"], "content", "csgo_addons", addon, "maps")
-    vmap = os.path.join(maps_dir, f"{map_name}.vmap")
-    refs = os.path.join(maps_dir, f"{map_name}_refs.txt")
-    started = time.time() - 2
+    refs, imported = [], set()
     try:
-        ok, _out = valve.import_map(gi, content_root, map_name, addon)
-    except ToolError as e:
-        ctx.log(str(e), "err")
-        ok = False
+        for name in (map_name,) + tuple(extra):
+            vmap = os.path.join(maps_dir, f"{name}.vmap")
+            ref = os.path.join(maps_dir, f"{name}_refs.txt")
+            started = time.time() - 2
+            try:
+                ok, _out = valve.import_map(gi, content_root, name, addon)
+            except ToolError as e:
+                ctx.log(str(e), "err")
+                ok = False
+            if name == map_name:
+                report.import_ok = ok and os.path.isfile(vmap)
+            if ok and os.path.isfile(vmap):
+                imported.add(name)
+                ctx.log(t("p_import_ok", path=vmap), "ok")
+                parts = len(vmapmod.map_files(maps_dir, name))
+                ctx.detail(t("d_import_files", n=parts, mb=os.path.getsize(vmap) / 1048576.0))
+            elif ok:
+                ctx.log(t("p_import_novmap"), "warn")
+            else:
+                ctx.log(t("p_import_fail"), "err")
+            if os.path.isfile(ref) and os.path.getmtime(ref) >= started:
+                refs.append(ref)
+            if name == map_name and not report.import_ok:
+                break
     finally:
         s1stub.remove_stub_game(work)
-    report.import_ok = ok and os.path.isfile(vmap)
-    if ok and os.path.isfile(vmap):
-        ctx.log(t("p_import_ok", path=vmap), "ok")
-        parts = len(vmapmod.map_files(maps_dir, map_name))
-        ctx.detail(t("d_import_files", n=parts, mb=os.path.getsize(vmap) / 1048576.0))
-    elif ok:
-        ctx.log(t("p_import_novmap"), "warn")
-    else:
-        ctx.log(t("p_import_fail"), "err")
-    if os.path.isfile(refs) and os.path.getmtime(refs) >= started:
-        return refs
-    return None
+    return refs, imported
 
 
 # ---------------------------------------------------------------------------
@@ -1805,7 +1980,7 @@ def export_files(ctx, items, out_dir, flat=False, cfg=None, extra=None):
             ctx.log(t("export_cancelled"), "warn")
             return None
     ctx.log(t("export_start", n=len(items), out=out_dir), "head")
-    archives, paks = {}, {}
+    reader = FoundReader()
     taken = set()
     done = 0
     try:
@@ -1818,23 +1993,7 @@ def export_files(ctx, items, out_dir, flat=False, cfg=None, extra=None):
             else:
                 dst = os.path.join(out_dir, *rel.split("/"))
             try:
-                low = where.lower()
-                if os.path.isfile(where) and low.endswith(".vpk"):
-                    if where not in archives:
-                        archives[where] = VPKArchive(where)
-                    data = archives[where].read(rel.lower())
-                elif os.path.isfile(where) and low.endswith(".bsp"):
-                    if where not in paks:
-                        zf = bspmod.BSPInfo(where).pakfile()
-                        paks[where] = (zf, {z.filename.replace("\\", "/").lower(): z.filename
-                                            for z in zf.infolist()} if zf else {})
-                    zf, names = paks[where]
-                    data = zf.read(names[rel.lower()])
-                elif os.path.isfile(where):
-                    with open(where, "rb") as f:
-                        data = f.read()
-                else:
-                    raise OSError(t("export_gone"))
+                data = reader.read(rel, where)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with open(dst, "wb") as f:
                     f.write(data)
@@ -1843,10 +2002,84 @@ def export_files(ctx, items, out_dir, flat=False, cfg=None, extra=None):
             except Exception as e:  # noqa: BLE001
                 ctx.log(t("export_fail", f=rel, e=e), "err")
     finally:
-        for arc in archives.values():
-            arc.close()
+        reader.close()
     ctx.log(t("export_done", n=done, out=out_dir, sec=time.time() - t0), "ok" if done == len(items) else "warn")
     return None
+
+
+class FoundReader:
+    """Reads a found file: rel (its game path) from where, which is the file itself, the
+    package (.vpk) or the .bsp it is in. Keeps the packages open until close()."""
+
+    def __init__(self):
+        self.archives, self.paks = {}, {}
+
+    def read(self, rel, where):
+        rel = rel.replace("\\", "/").strip("/")
+        low = where.lower()
+        if os.path.isfile(where) and low.endswith(".vpk"):
+            if where not in self.archives:
+                self.archives[where] = VPKArchive(where)
+            return self.archives[where].read(rel.lower())
+        if os.path.isfile(where) and low.endswith(".bsp"):
+            if where not in self.paks:
+                zf = bspmod.BSPInfo(where).pakfile()
+                self.paks[where] = (zf, {z.filename.replace("\\", "/").lower(): z.filename
+                                         for z in zf.infolist()} if zf else {})
+            zf, names = self.paks[where]
+            return zf.read(names[rel.lower()])
+        if os.path.isfile(where):
+            with open(where, "rb") as f:
+                return f.read()
+        raise OSError(t("export_gone"))
+
+    def close(self):
+        for arc in self.archives.values():
+            arc.close()
+        self.archives = {}
+
+
+# the other files a compiled model is made of (taken along when a .mdl is pasted)
+_MDL_PARTS = (".vvd", ".dx90.vtx", ".dx80.vtx", ".sw.vtx", ".vtx", ".phy", ".ani")
+
+
+def stage_found(items, exts, dest):
+    """Files found by a search (items: [(rel, where)]) as files on disk for a tool: the ones
+    with one of exts. A loose file is used where it is; a file in a package or a .bsp is
+    written under dest with its game path (materials/..., models/...), a model with its parts.
+    Returns (paths, failed names)."""
+    paths, failed = [], []
+    reader = FoundReader()
+    try:
+        for rel, where in items:
+            rel = rel.replace("\\", "/").strip("/")
+            if not rel.lower().endswith(tuple(exts)):
+                continue
+            if os.path.isfile(where) and not where.lower().endswith((".vpk", ".bsp")):
+                paths.append(where)
+                continue
+            dst = os.path.join(dest, *rel.split("/"))
+            try:
+                data = reader.read(rel, where)
+            except Exception:  # noqa: BLE001
+                failed.append(rel)
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(data)
+            paths.append(dst)
+            if rel.lower().endswith(".mdl"):
+                for ext in _MDL_PARTS:
+                    part = rel[:-4] + ext
+                    try:
+                        data = reader.read(part, where)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    with open(os.path.join(dest, *part.split("/")), "wb") as f:
+                        f.write(data)
+    finally:
+        reader.close()
+    return paths, failed
 
 
 def _addon_index(cfg, ctx, addon_name):

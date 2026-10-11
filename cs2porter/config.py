@@ -75,7 +75,6 @@ DEFAULTS = {
     # the user set the bhop blocks option (before that bhop_ maps get it on their own)
     "bhop_blocks_user": False,
     "find_mode": "contains",
-    "miss_addon": "",
     "opts": {
         "overwrite": False,
         "convert_cs2_existing": False,
@@ -92,6 +91,12 @@ DEFAULTS = {
         "sky_moondome": True,
         # a model material found nowhere is replaced by a CS2 material, so the model compiles
         "model_placeholder": True,
+        # env_sun is drawn into the sky texture and left out of the CS2 map
+        "sun_in_sky": True,
+        # the 3D skybox room (sky_camera) becomes <map>_cs2porter_skybox.vmap
+        "sky3d": True,
+        # brush textures that vanish with distance by their own mips get faces that fade out
+        "mip_fade": True,
     },
     # the map list of the Port Map tab: [[map path, addon name], ...]
 }

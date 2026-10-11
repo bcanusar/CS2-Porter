@@ -38,6 +38,56 @@ class BSPError(Exception):
     pass
 
 
+class PakZip(zipfile.ZipFile):
+    """The pakfile. Some packing tools leave a file twice in it: the central directory points
+    at a damaged copy (its data is the end of another file, the CRC fails) and the good copy
+    comes later. read() then takes the copy of that name whose data matches the CRC."""
+
+    def __init__(self, raw):
+        super().__init__(io.BytesIO(raw))
+        self._raw = raw
+
+    def read(self, name, pwd=None):
+        try:
+            return super().read(name, pwd)
+        except zipfile.BadZipFile:
+            zi = name if isinstance(name, zipfile.ZipInfo) else self.getinfo(name)
+            data = self._other_copy(zi)
+            if data is None:
+                raise
+            return data
+
+    def _other_copy(self, zi):
+        import zlib
+        raw = self._raw
+        try:
+            key = zi.filename.encode("utf-8" if zi.flag_bits & 0x800 else "cp437")
+        except UnicodeEncodeError:
+            return None
+        pos = raw.find(key)
+        while pos != -1:
+            ofs = pos - 30
+            if ofs >= 0 and raw[ofs:ofs + 4] == b"PK\x03\x04":
+                method, = struct.unpack_from("<H", raw, ofs + 8)
+                csize, size, nlen, xlen = struct.unpack_from("<IIHH", raw, ofs + 18)
+                if nlen == len(key):
+                    start = pos + nlen + xlen
+                    if not csize and zi.compress_size:
+                        csize, size = zi.compress_size, zi.file_size  # sizes only in the central directory
+                    data = raw[start:start + csize]
+                    try:
+                        if method == zipfile.ZIP_DEFLATED:
+                            data = zlib.decompressobj(-15).decompress(data)
+                        elif method != zipfile.ZIP_STORED:
+                            data = None
+                    except zlib.error:
+                        data = None
+                    if data is not None and len(data) == zi.file_size and zlib.crc32(data) == zi.CRC:
+                        return data
+            pos = raw.find(key, pos + 1)
+        return None
+
+
 class BSPInfo:
     def __init__(self, path):
         self.path = path
@@ -78,7 +128,7 @@ class BSPInfo:
         data = self.read_lump(LUMP_PAKFILE)
         if not data:
             return None
-        return zipfile.ZipFile(io.BytesIO(data))
+        return PakZip(data)
 
     def worldspawn_keys(self):
         """Reads the worldspawn keys from the entity lump (skyname etc.)."""
@@ -195,8 +245,9 @@ def _recover_copy(name, data, packed, out_dir):
     return m.group(1)
 
 
-def extract_pakfile(bsp_path, out_dir, smart=True, log=None):
-    """Extracts the files embedded in the BSP into out_dir. Returns the extracted relative paths."""
+def extract_pakfile(bsp_path, out_dir, smart=True, log=None, damaged=None):
+    """Extracts the files embedded in the BSP into out_dir. Returns the extracted relative paths.
+    damaged (a set) receives the lower case names of the files that could not be read."""
     info = BSPInfo(bsp_path)
     zf = info.pakfile()
     if zf is None:
@@ -225,6 +276,8 @@ def extract_pakfile(bsp_path, out_dir, smart=True, log=None):
                 data = zf.read(zi)
             except Exception as e:  # noqa: BLE001
                 failed += 1
+                if damaged is not None:
+                    damaged.add(name.lower())
                 if log:
                     log(t("bsp_read_fail", name=name, e=e), "warn")
                 continue

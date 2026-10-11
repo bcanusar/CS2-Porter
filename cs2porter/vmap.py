@@ -52,7 +52,8 @@ class Fixes:
                  bhop=False, attributes=None, meshes=None, blends=None, fgd=None, collapse=True,
                  ropes=None, ambients=None, water=None, commands=False, uv_sizes=None,
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
-                 surface_lights=None, underwater=None, sprite_textures=None, decals=None):
+                 surface_lights=None, underwater=None, sprite_textures=None, decals=None,
+                 skybox_ref=None, sky_map=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
         self.moondome_vmat = moondome_vmat  # material for the sky brushes (None: tools/toolsskybox)
@@ -84,6 +85,11 @@ class Fixes:
         self.glow_particles = {}            # filled by the glow step: vpcf -> texture
         # infodecals and the faces they sit on (vmf.decal_surfaces)
         self.decals = decals or []
+        # main map of a 3D skybox: the skybox map its skybox_reference shows ('maps/x.vmap')
+        self.skybox_ref = skybox_ref
+        # the skybox map itself: {"offset": moves the sky_camera onto the origin, "box": (mins,
+        # maxs) of the room before the move}
+        self.sky_map = sky_map
 
 
 class Result:
@@ -269,6 +275,19 @@ def set_env_sky(text, vmat):
             in_sky = False
             count += 1
     return "\n".join(lines), count
+
+
+_SKY_ANGLES_RE = re.compile(r'"classname" "string" "env_sky".*?"angles" "qangle" "([^"]*)"', re.S)
+
+
+def env_sky_angles(path):
+    """(pitch, yaw, roll) of the env_sky in a text .vmap; None when there is none."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            m = _SKY_ANGLES_RE.search(f.read())
+        return tuple(float(v) for v in m.group(1).split()[:3]) if m else None
+    except (OSError, ValueError):
+        return None
 
 
 _PROPS_RE = re.compile(r'"entity_properties" "EditGameClassProps"\s*\r?\n[ \t]*\{')
@@ -825,6 +844,76 @@ def remove_named(text, prefix):
     return _join_world(text, start, end, keep, m.group(0) if m else "\t\t"), len(elems) - len(keep)
 
 
+# --- 3D skybox (sky3d.py) ------------------------------------------------------------------
+
+SKYBOX_NAME = "cs2porter_skybox"
+SKY_ENV_STEP = 32.0         # the env_sky stands this far from the sky_camera (the copied entities on the other side)
+_USAGE_RE = re.compile(r'("mapUsageType" "string" ")[^"]*(")')
+
+
+def skybox_reference_block(ind, target):
+    """skybox_reference on the origin that shows the skybox map ('maps/x.vmap')."""
+    return element_block(ind, [("classname", "skybox_reference"), ("targetname", f"{SKYBOX_NAME}_1"),
+                               ("targetMapName", target), ("fixupNames", "0"),
+                               ("worldGroupID", "skyboxWorldGroup0")])
+
+
+def skybox_volume_block(ind, lo, hi):
+    """env_combined_light_probe_volume over the whole skybox room (no white room: it bakes in
+    the room's middle)."""
+    c = tuple(round((lo[k] + hi[k]) / 2.0) for k in range(3))
+    return element_block(ind, [
+        ("classname", "env_combined_light_probe_volume"), ("targetname", f"{SKYBOX_NAME}_light_1"),
+        ("StartDisabled", "0"), ("cubemaptexture", ""), ("bakefarz", "4096.0"),
+        ("box_mins", " ".join(f"{lo[k] - c[k]:.6f}" for k in range(3))),
+        ("box_maxs", " ".join(f"{hi[k] - c[k]:.6f}" for k in range(3))),
+        ("voxel_size", probesmod.VOXEL_SIZE), ("flood_fill", "0"), ("voxelize", "0"),
+        ("indoor_outdoor_level", "0"), ("edge_fade_dists", "0 0 0"), ("clientSideEntity", "1")],
+        origin=" ".join(_num(v) for v in c))
+
+
+def finish_skybox_map(text, offset):
+    """The skybox map: every node moves by offset (the sky_camera onto the origin), Map
+    Properties call it a 3D skybox, and the sky_camera is not editor only (the importer makes it
+    so). The env_sky the importer puts on the origin goes next to the sky_camera; its
+    post_processing_volume is left out (the main map's applies). Returns (text, moved nodes)."""
+    start, end = _world_children(text)
+    elems = _split_elements(text, start, end)
+    out, moved = [], 0
+    for e in elems:
+        if is_null_element(e):
+            out.append(e)
+            continue
+        cls = re.search(r'"classname" "string" "([^"]*)"', e) if e.lstrip().startswith('"CMapEntity"') else None
+        cls = cls.group(1) if cls else ""
+        if cls == "post_processing_volume":
+            continue
+        ind = re.match(r"[ \t]*", e).group(0)
+        if cls == "env_sky":
+            # the node's own origin is its last one (children come first)
+            m = None
+            for m in re.finditer(r'\n%s\t"origin" "vector3" "([^"]*)"' % ind, e):
+                pass
+            if m:
+                e = e[:m.start(1)] + f"{-SKY_ENV_STEP:g} 0 0" + e[m.end(1):]
+        else:
+            # child origins are world positions too (an entity's meshes, water), so all move
+            def shift(m):
+                try:
+                    p = [float(v) + d for v, d in zip(m.group(2).split(), offset)]
+                except ValueError:
+                    return m.group(0)
+                return m.group(1) + " ".join(_num(v) for v in p) + '"'
+            e, n = re.subn(r'(\n[ \t]*"origin" "vector3" ")([^"]*)"', shift, e)
+            moved += 1 if n else 0
+        if cls == "sky_camera":
+            e = re.sub(r'(\n%s\t"editorOnly" "bool" ")1"' % ind, r'\g<1>0"', e)
+        out.append(e)
+    m = re.match(r"[ \t]*", text[text.rfind("\n", 0, start) + 1:])
+    text = _join_world(text, start, end, out, m.group(0) if m else "\t\t")
+    return _USAGE_RE.sub(r"\g<1>skybox\g<2>", text, count=1), moved
+
+
 def bhop_entity_blocks(texts, ind):
     """Blocks for the bhop entities that are not in the map yet."""
     return world_entity_blocks(texts, ind, bhop_script=True)[0]
@@ -1129,6 +1218,12 @@ def _paint(text, fx, stats):
             text = uvfix.fix_animated_uvs(text, fx.uv_sizes, stats)
         except (ValueError, IndexError, KeyError) as e:
             stats.setdefault("errors", []).append(f"anim uv: {e}")
+    if fx.sky_map:
+        # last: the edits before work in the original map's places
+        try:
+            text, stats["sky_moved"] = finish_skybox_map(text, fx.sky_map["offset"])
+        except ValueError as e:
+            stats.setdefault("errors", []).append(f"skybox: {e}")
     return text
 
 
@@ -1251,6 +1346,17 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
             stats["light_volumes"] = len(fx.light_rooms)
             stats["light_rooms"] = sum(1 for r in fx.light_rooms if r[2])
         except (ValueError, OSError) as e:
+            log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
+    if fx.skybox_ref or fx.sky_map:
+        try:
+            texts[main], _old = remove_named(texts[main], SKYBOX_NAME)
+            texts[main], _old = remove_named(texts[main], SKYBOX_NAME + "_light")
+            start, _end = _world_children(texts[main])
+            ind = re.match(r"[ \t]*", texts[main][texts[main].rfind("\n", 0, start) + 1:]).group(0) + "\t"
+            block = skybox_reference_block(ind, fx.skybox_ref) if fx.skybox_ref else \
+                skybox_volume_block(ind, *fx.sky_map["box"])
+            texts[main] = renumber_nodes(add_to_world(texts[main], [block]))
+        except ValueError as e:
             log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
 
     # --- collapse the prefabs into the main map -------------------------------------

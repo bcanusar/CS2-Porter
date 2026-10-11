@@ -756,14 +756,14 @@ def pick_sky_alias(materials):
     return name
 
 
-def _swap_sky_material(root, alias):
+def _swap_sky_material(root, alias, mats=SKYBOX_MATS):
     count = 0
     stack = [root]
     while stack:
         node = stack.pop()
         for ch in node.children():
             if ch.name.lower() == "side":
-                if normalize_material(ch.get("material", "")) in SKYBOX_MATS:
+                if normalize_material(ch.get("material", "")) in mats:
                     ch.set("material", alias)
                     count += 1
             else:
@@ -1590,6 +1590,132 @@ def _fix_odd_triggers(root, world=None):
             floor += lowered
         ent.items = new_items
     return split, floor
+
+
+# --- textures that vanish with distance ---------------------------------------------------
+
+# Source 1 picks a mip level by the texels that fall on one screen pixel: at 1920x1080 with
+# the 90 degree (4:3) field of view a texel s units wide d units away is d / (MIP_PX * s)
+# pixels, so mip level k takes over at d = MIP_PX * s * 2^k (seen straight on).
+MIP_PX = 720.0
+FADE_DEPTH = 1.0            # the faded copy of a face is this thick, inside its brush
+FADE_TILE_MIN = 128         # the copy is cut into tiles that fade on their own
+FADE_TILE_MAX = 1024
+FADE_MAX_TILES = 256        # per face (the tiles grow until it fits)
+FADE_MARKER = MESH_MARKER + "fade_"
+NODRAW = "tools/toolsnodraw"
+_STATIC_BRUSHES = ("func_brush", "func_wall", "func_illusionary", "func_detail", "func_lod")
+
+
+def _texel_size(side):
+    vals = []
+    for key in ("uaxis", "vaxis"):
+        m = re.search(r"\]\s*(\S+)", side.get(key) or "")
+        v = _float(m.group(1)) if m else None
+        if v:
+            vals.append(abs(v))
+    return sum(vals) / len(vals) if vals else None
+
+
+def fade_distances(side, levels):
+    """(start, end) of the fade of the face whose texture vanishes at these mip levels
+    (materials.mip_fade), None when the face has no texture scale."""
+    s = _texel_size(side)
+    if not s:
+        return None
+    first, gone = levels
+    return MIP_PX * s * 2 ** (first - 1), MIP_PX * s * 2 ** gone
+
+
+def _tile_cells(lo, hi, size):
+    ranges = [range(math.floor(lo[k] / size + 1e-6), max(math.floor(lo[k] / size + 1e-6) + 1,
+                                                          math.ceil(hi[k] / size - 1e-6))) for k in range(3)]
+    return [(i, j, k) for i in ranges[0] for j in ranges[1] for k in ranges[2]]
+
+
+def fade_faces(root, fades, meshes):
+    """Faces whose texture vanishes with distance in Source 1 (fades: {material: mip levels},
+    materials.mip_fade). CS2 can only fade a whole mesh, so the face gets a FADE_DEPTH thick copy
+    inside its brush, cut into tiles, each tile fading out on its own at the distance the mips
+    gave (see MIP_PX); the face itself and the copy's other faces become nodraw, the brush keeps
+    its collision. World brushes and brush entities that never change (no inputs / outputs)
+    only. The tiles of one place go into one func_brush that becomes meshes (meshes receives
+    their settings). Returns (faces, tiles)."""
+    from .blend import _outward_planes
+    refs = _referenced_names(root)
+    holders = [w for w in (root.child("world"),) if w is not None]
+    holders += [e for e in root.children("entity") if e.classname in _STATIC_BRUSHES and not _outputs(e)
+                and not _is_referenced(e.get("targetname") or "", refs)]
+    max_id = _max_solid_id(root)
+    cells = {}
+    faces_done = 0
+    for holder in holders:
+        for solid in holder.children("solid"):
+            sides = solid.children("side")
+            hits = [s for s in sides if normalize_material(s.get("material", "")) in fades]
+            if not hits or any(s.child("dispinfo") is not None for s in sides):
+                continue
+            planes = _outward_planes(sides)
+            if not planes:
+                continue
+            planes = [(tuple(p[0]), p[1]) for p in planes]
+            for side in hits:
+                dist = fade_distances(side, fades[normalize_material(side.get("material", ""))])
+                if dist is None:
+                    continue
+                n, d = planes[sides.index(side)]
+                slab_p = planes + [((-n[0], -n[1], -n[2]), -(d - FADE_DEPTH))]
+                slab_s = list(sides) + [None]
+                slab = _brush_faces(slab_p, slab_s)
+                if side not in slab[1]:
+                    continue
+                pts = [p for poly in slab[2] for p in poly]
+                lo = [min(p[k] for p in pts) for k in range(3)]
+                hi = [max(p[k] for p in pts) for k in range(3)]
+                size = FADE_TILE_MIN
+                while size < FADE_TILE_MAX and size * 4 <= dist[0]:
+                    size *= 2
+                while len(_tile_cells(lo, hi, size)) > FADE_MAX_TILES:
+                    size *= 2
+                pieces = []
+                for cell in _tile_cells(lo, hi, size):
+                    cut_p, cut_s = list(slab[0]), list(slab[1])
+                    for k in range(3):
+                        a, b = cell[k] * size, (cell[k] + 1) * size
+                        axis = tuple(1.0 if j == k else 0.0 for j in range(3))
+                        if lo[k] < a - 0.01:
+                            cut_p.append((tuple(-x for x in axis), -a))
+                        if hi[k] > b + 0.01:
+                            cut_p.append((axis, b))
+                    cut_s += [None] * (len(cut_p) - len(cut_s))
+                    piece = _brush_faces(cut_p, cut_s) if len(cut_p) > len(slab[0]) else slab
+                    if side in piece[1] and len(piece[0]) >= 4:
+                        pieces.append((cell, piece))
+                if not pieces:
+                    continue
+                nodes, last = [], max_id
+                for cell, piece in pieces:
+                    last, node = _solid_from(solid, *piece, last)
+                    for new_side, src in zip(node.children("side"), piece[1]):
+                        if src is not side:
+                            new_side.set("material", NODRAW)
+                    nodes.append((cell, node))
+                if not all(_solid_ok(node) for _cell, node in nodes):
+                    continue            # a piece the editor would read differently: the face stays
+                max_id = last
+                side.set("material", NODRAW)
+                faces_done += 1
+                for cell, node in nodes:
+                    cells.setdefault((cell, size, round(dist[0]), round(dist[1])), []).append(node)
+    for k, ((_cell, _size, start, end), solids) in enumerate(cells.items(), 1):
+        marker = f"{FADE_MARKER}{k}"
+        meshes[marker] = {"fade": (start, end), "physics_none": True, "no_shadows": True}
+        ent = VNode("entity")
+        max_id += 1
+        ent.items = [["id", str(max_id)], ["classname", "func_brush"], ["targetname", marker],
+                     ["Solidity", "1"]] + solids
+        root.items.append(ent)
+    return faces_done, len(cells)
 
 
 def _walk(node):

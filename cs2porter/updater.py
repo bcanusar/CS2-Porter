@@ -128,20 +128,37 @@ def download(release, progress=None, cancelled=None):
     os.makedirs(root, exist_ok=True)
     zpath = os.path.join(root, "update.zip")
     got = 0
-    with urllib.request.urlopen(_request(release.zip_url), timeout=30) as r, open(zpath, "wb") as f:
-        total = int(r.headers.get("Content-Length") or release.zip_size or 0)
-        while True:
-            if cancelled is not None and cancelled():
-                f.close()
-                shutil.rmtree(root, ignore_errors=True)
-                return None
-            chunk = r.read(256 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-            got += len(chunk)
-            if progress is not None:
-                progress(got, total)
+    total = int(release.zip_size or 0)
+    # a stalled connection (the GitHub download server sometimes stops for a while) does not
+    # end the update: the download goes on from where it stopped, a few times
+    for attempt in range(6):
+        req = _request(release.zip_url)
+        if got:
+            req.add_header("Range", f"bytes={got}-")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r, open(zpath, "ab" if got else "wb") as f:
+                if got and getattr(r, "status", 200) != 206:
+                    got = 0     # no resume: start again from the beginning
+                    raise OSError("the server does not resume downloads")
+                if not got:
+                    total = int(r.headers.get("Content-Length") or total or 0)
+                while True:
+                    if cancelled is not None and cancelled():
+                        f.close()
+                        shutil.rmtree(root, ignore_errors=True)
+                        return None
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress is not None:
+                        progress(got, total)
+            break
+        except OSError:
+            # socket.timeout and URLError are OSError too
+            if attempt == 5:
+                raise
     if total and got != total:
         raise OSError(f"the download stopped early ({got} of {total} bytes)")
     out = os.path.join(root, "files")

@@ -660,6 +660,56 @@ def parse_vmt(data, path, loader=None, _depth=0):
     return VMT(shader, params, path, top)
 
 
+MIP_GONE = 0.1          # a mip level this much as visible as the top one counts as gone
+MIP_FAINT = 0.9         # ... and this much as fainter
+
+
+def mip_fade(sources, mat):
+    """Source 1 textures made to vanish with distance by their own lower mips (bhop_eternity's
+    grid lines only show up close): (first, gone) = the first mip level fainter than the top one
+    and the level from which on every level is gone. None for any other material. CS2 makes its
+    own mips from the top level, so there the texture shows at any distance."""
+    rel = f"materials/{mat}.vmt"
+    data, _src = sources.read(rel)
+    if not data:
+        return None
+    try:
+        vmt = parse_vmt(data, rel, lambda r: sources.read(r)[0])
+    except Exception:  # noqa: BLE001 - a broken VMT is reported by the material step
+        return None
+    additive = vmt.flag("$additive")
+    alpha = vmt.flag("$translucent") or vmt.flag("$alphatest")
+    tex = norm_tex(vmt.get("$basetexture", ""))
+    if not (additive or alpha) or not tex:
+        return None
+    vtf_data, _src = sources.read(f"materials/{tex}.vtf")
+    if not vtf_data:
+        return None
+    try:
+        mips = vtfmod.load_vtf_mips(vtf_data)
+    except Exception:  # noqa: BLE001
+        return None
+    # how much of the texture shows: alpha (translucent / alpha tested) times brightness (additive)
+    seen = []
+    for img in mips:
+        if min(img.size) < 4:
+            break
+        a = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
+        v = np.ones(a.shape[:2], np.float32)
+        if alpha:
+            v *= a[..., 3]
+        if additive:
+            v *= a[..., :3].max(axis=2)
+        seen.append(float(v.mean()))
+    if len(seen) < 3 or seen[0] < 0.002:
+        return None
+    gone = next((k for k in range(1, len(seen)) if max(seen[k:]) < seen[0] * MIP_GONE), None)
+    if gone is None:
+        return None
+    first = next(k for k in range(1, gone + 1) if seen[k] < seen[0] * MIP_FAINT)
+    return first, gone
+
+
 def _fallback_base(vmt):
     """$basetexture of a fallback block ("lightmappedgeneric_dx6" { ... }) that is a real texture."""
     if vmt.block is None:
@@ -1068,6 +1118,37 @@ class MaterialConverter:
         except (OSError, ValueError):
             return None
 
+    def _modulate_layers(self, color):
+        """(color texture, translucency texture) of a translucent decal that looks like a
+        DecalModulate one. Source 1 multiplies what is behind it by 2 x texture (mid gray changes
+        nothing); here every pixel becomes a color laid over the wall with an opacity, chosen
+        so that a mid gray wall gets the same result: darker parts turn into black, brighter
+        parts into white, colored parts into their tint. None when the texture can not be read."""
+        if color.startswith("["):
+            return None
+        base = color.rsplit(".", 1)[0] + "_mod"
+        out_c, out_m = base + ".tga", base + "_mask.tga"
+        if os.path.isfile(self._abs(out_c)) and os.path.isfile(self._abs(out_m)):
+            return out_c, out_m
+        try:
+            with Image.open(self._abs(color)) as img:
+                rgba = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
+            m = rgba[..., :3] * (255.0 / 127.5)     # what the wall is multiplied by
+            a = np.clip(np.abs(m - 1.0).max(axis=2), 0.0, 1.0)
+            if img.mode in ("RGBA", "LA", "PA"):
+                a *= rgba[..., 3]                  # the texture's own alpha fades the decal too
+            a[a < 0.02] = 0.0
+            wall = 0.5
+            col = np.where(a[..., None] > 0, wall * (m - 1.0 + a[..., None]) / np.maximum(a, 1e-4)[..., None], 0.0)
+            col = np.clip(col, 0.0, 1.0)
+            os.makedirs(os.path.dirname(self._abs(out_c)), exist_ok=True)
+            Image.fromarray((col * 255 + 0.5).astype(np.uint8), "RGB").save(self._abs(out_c))
+            mask = (a * 255 + 0.5).astype(np.uint8)
+            Image.merge("RGB", [Image.fromarray(mask, "L")] * 3).save(self._abs(out_m))
+            return out_c, out_m
+        except (OSError, ValueError):
+            return None
+
     def _self_illum_mask(self, vmt, color, is_unlit):
         """Where a $selfillum material glows: $selfillummask, else the alpha of the base texture
         (Source 1 lit shaders), else everywhere (unlit shaders, or no alpha)."""
@@ -1317,7 +1398,11 @@ class MaterialConverter:
                     content = VC.TMPL_GLASS_OPAQUE.format(color=color)
                     tag = "glass (opaque)"
             elif is_decal:
-                if transparent and trans:
+                layers = self._modulate_layers(color) if shader == "decalmodulate" else None
+                if layers:
+                    content = VC.TMPL_DECAL_TRANSLUCENT.format(color=layers[0], transculent=layers[1])
+                    tag = "decal + modulate"
+                elif transparent and trans:
                     content = VC.TMPL_DECAL_TRANSLUCENT.format(color=color, transculent=trans)
                     tag = "decal + translucent"
                 else:

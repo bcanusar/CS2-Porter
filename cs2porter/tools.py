@@ -364,8 +364,37 @@ def _flat_target(f, out, ext):
     return os.path.join(out, os.path.splitext(os.path.basename(f))[0] + ext)
 
 
+def find_background(rgb):
+    """The plain background color of an image without alpha, read from its border, or None
+    when the border is not one color (a photo, a tiling texture). rgb: float array 0..1."""
+    h, w = rgb.shape[:2]
+    if h < 8 or w < 8:
+        return None
+    b = max(1, min(h, w) // 64)
+    border = np.concatenate([rgb[:b].reshape(-1, 3), rgb[-b:].reshape(-1, 3),
+                             rgb[:, :b].reshape(-1, 3), rgb[:, -b:].reshape(-1, 3)])
+    bg = np.median(border, axis=0)
+    near = np.abs(border - bg).max(axis=1) < 0.08
+    return bg if near.mean() >= 0.6 else None
+
+
+def color_to_alpha(rgb, bg, low=0.04, high=0.5):
+    """(color, alpha) that lay over the background give the image back: each pixel's alpha is
+    how far it is from the background color (as a share of how far it could be), the color is
+    the pixel with the background taken out. Below low a pixel is fully transparent (noise of
+    the background), from high on it is fully opaque (the subject keeps its own color)."""
+    bg = np.asarray(bg, dtype=np.float32)
+    up = np.where(rgb > bg, (rgb - bg) / np.maximum(1.0 - bg, 1e-4), 0.0)
+    down = np.where(rgb < bg, (bg - rgb) / np.maximum(bg, 1e-4), 0.0)
+    a = np.clip(np.maximum(up, down).max(axis=2), 0.0, 1.0)
+    a = np.clip((a - low) / (high - low), 0.0, 1.0)
+    col = np.where(a[..., None] > 0, bg + (rgb - bg) / np.maximum(a, 1e-4)[..., None], rgb)
+    return np.clip(col, 0.0, 1.0), a
+
+
 def run_trans(items, out, opts, log, cfg=None, cancel=None, status=None):
     overwrite = opts.get("overwrite", False)
+    find_bg = opts.get("find_background", True)
     ok = skip = fail = 0
     for it in items:
         if cancel is not None and cancel.is_set():
@@ -382,17 +411,33 @@ def run_trans(items, out, opts, log, cfg=None, cancel=None, status=None):
             alpha = None
             if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
                 alpha = np.asarray(img.convert("RGBA").getchannel("A"))
+            made = [dst]
             if alpha is None or alpha.min() == 255:
-                skip += 1
-                log(t("tl_mask_skip", f=it["name"]), "dim")
-                _report(status, it["id"], "skip", t("tl_no_alpha"))
-                continue
+                # no alpha: the background is worked out from the picture itself
+                rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+                bg = find_background(rgb) if find_bg else None
+                if bg is None:
+                    skip += 1
+                    log(t("tl_mask_skip", f=it["name"]), "dim")
+                    _report(status, it["id"], "skip", t("tl_no_bg" if find_bg else "tl_no_alpha"))
+                    continue
+                col, a = color_to_alpha(rgb, bg)
+                alpha = (a * 255 + 0.5).astype(np.uint8)
+                # the color without the background mixed into the edges
+                cdst = os.path.join(out, base + "_color" + ext)
+                if overwrite or not os.path.isfile(cdst):
+                    os.makedirs(out, exist_ok=True)
+                    Image.fromarray((col * 255 + 0.5).astype(np.uint8), "RGB").save(cdst)
+                    made.append(cdst)
+                hexbg = "#" + "".join(f"{int(round(c * 255)):02x}" for c in bg)
+                log(t("tl_bg_found", f=it["name"], c=hexbg), "dim")
             mask = Image.fromarray(np.stack([alpha] * 3, axis=2), "RGB")
             os.makedirs(out, exist_ok=True)
             mask.save(dst)
             ok += 1
-            log(f"  OK  {os.path.basename(dst)}", "info")
-            _report(status, it["id"], "created", os.path.basename(dst))
+            for m in made:
+                log(f"  OK  {os.path.basename(m)}", "info")
+            _report(status, it["id"], "created", ", ".join(os.path.basename(m) for m in made))
         except Exception as e:  # noqa: BLE001
             fail += 1
             log(t("tl_error", f=it["name"], e=e), "err")
@@ -759,7 +804,7 @@ TOOLS = [
      "options": {"overwrite": False, "formats": True}, "run": run_image},
     {"id": "trans", "group": "port", "name": "t_trans_name", "desc": "t_trans_desc", "exts": (".png", ".tga"),
      "keep": lambda f: not os.path.splitext(f)[0].lower().endswith("_transculent"),
-     "options": {"overwrite": False}, "run": run_trans},
+     "options": {"overwrite": False, "find_background": True}, "run": run_trans},
     {"id": "skybox", "group": "port", "name": "t_sky_name", "desc": "t_sky_desc", "exts": _IMAGE_EXTS,
      "rows": "sky", "add": "folder", "options": {"overwrite": False}, "run": run_skybox},
     {"id": "fbx", "group": "assets", "name": "t_fbx_name", "desc": "t_fbx_desc", "exts": (".fbx",),

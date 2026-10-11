@@ -1,2 +1,2 @@
 ﻿"""CS2 Porter - ports CSS / CS:GO maps to CS2."""
-__version__ = "2.30.0"
+__version__ = "2.40.0"

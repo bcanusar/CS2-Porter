@@ -13,7 +13,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, ttk
 
-from . import __version__, bsp as bspmod, config, i18n, pipeline, tools, updater
+from . import __version__, addons as addonsmod, bsp as bspmod, config, i18n, pipeline, tools, updater
 from .i18n import t
 from .valve_tools import Cancelled, ToolError
 
@@ -48,7 +48,7 @@ def set_theme(name):
     globals().update(THEMES.get(name) or THEMES["dark"])
     STATUS_COLORS.update({
         "created": OK, "exists": MUTED, "cs2": MUTED, "tool": MUTED, "skip": MUTED,
-        "missing": ERR, "error": ERR, "unsupported": WARN, "placeholder": WARN, "ok": OK, "found": INFO,
+        "missing": ERR, "error": ERR, "unsupported": WARN, "warning": WARN, "ok": OK, "found": INFO,
     })
 
 
@@ -502,7 +502,7 @@ class ResultTable(ttk.Frame):
     # row status -> group of the Show boxes and the counts
     GROUPS = (("created", ("created",)), ("have", ("exists", "cs2", "tool", "skip")),
               ("missing", ("missing", "error")), ("unsupported", ("unsupported",)),
-              ("placeholder", ("placeholder",)), ("found", ("found",)))
+              ("warning", ("warning",)), ("found", ("found",)))
     COLS = ("kind", "path", "status", "detail", "source", "map")
 
     def __init__(self, master, export=None, find=None, with_map=False, with_game=False, in_folder=False):
@@ -579,6 +579,8 @@ class ResultTable(ttk.Frame):
             self.tree.tag_configure(st, foreground=color)
         self.tree.bind("<Double-1>", self._double_click)
         self.tree.bind("<Button-3>", self._context_menu)
+        for seq in ("<Control-c>", "<Control-C>"):
+            self.tree.bind(seq, lambda e: self.copy_found())
         self.rows = []
         self.content_dir = ""
         self.content_dirs = {}      # map name -> its addon content folder (several maps)
@@ -755,16 +757,15 @@ class ResultTable(ttk.Frame):
         for r in rows:
             count[self.group_of.get(r[2], "have")] += 1
         if count["found"] and not (count["created"] or count["missing"] or count["unsupported"] or count["have"]
-                                   or count["placeholder"]):
+                                   or count["warning"]):
             parts = [(t("table_found", n=count["found"]), None, None)]
         else:
             parts = [(t("table_created", n=count["created"]), "ok" if count["created"] else None, "created"),
                      (t("table_have", n=count["have"]), None, "have"),
                      (t("table_missing", n=count["missing"]), "err" if count["missing"] else None, "missing"),
                      (t("table_uns", n=count["unsupported"]), "warn" if count["unsupported"] else None,
-                      "unsupported")]
-            if count["placeholder"]:
-                parts.append((t("table_placeholder", n=count["placeholder"]), "warn", "placeholder"))
+                      "unsupported"),
+                     (t("table_warning", n=count["warning"]), "warn" if count["warning"] else None, "warning")]
             if count["found"]:
                 parts.insert(0, (t("table_found", n=count["found"]), None, None))
         # how many rows the filters leave (always there, so the bar does not jump)
@@ -852,6 +853,14 @@ class ResultTable(ttk.Frame):
         self.clipboard_clear()
         self.clipboard_append(text)
 
+    def copy_found(self, items=None):
+        """Copies the selected found files for a paste into a tool's list (not the files
+        themselves: their game paths and where they are, which the lists read back)."""
+        found = items if items is not None else self._found_items(self.tree.selection())
+        if found:
+            self._copy(found_to_clipboard(found))
+        return "break"
+
     def _context_menu(self, e):
         iid = self.tree.identify_row(e.y)
         if not iid:
@@ -865,6 +874,11 @@ class ResultTable(ttk.Frame):
         row = self._row(iid)
         menu = popup_menu(self)
         found = self._found_items(sel)
+        if found:
+            menu.add_command(label=t("menu_copy_files", n=len(found)) if len(found) > 1 else t("menu_copy_file"),
+                             accelerator="Ctrl+C", command=lambda: self.copy_found(found))
+            if self.export is None:
+                menu.add_separator()
         if self.export is not None and found:
             label = t("export_selected", n=len(found)) if len(found) > 1 else t("export_one")
             menu.add_command(label=label, command=lambda: self.export(found, False))
@@ -891,6 +905,27 @@ class ResultTable(ttk.Frame):
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+
+
+# first line of copied found files on the clipboard; then one "game path<TAB>where" per line
+CLIP_HEAD = "CS2 Porter files"
+
+
+def found_to_clipboard(items):
+    return "\n".join([CLIP_HEAD] + [f"{rel}\t{where}" for rel, where in items])
+
+
+def found_from_clipboard(text):
+    """[(game path, where)] of copied found files, or None when the text is something else."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() != CLIP_HEAD:
+        return None
+    out = []
+    for line in lines[1:]:
+        rel, sep, where = line.partition("\t")
+        if sep and rel.strip() and where.strip():
+            out.append((rel.strip(), where.strip()))
+    return out
 
 
 def sort_tree_heading(tree, cols, labels, col, desc):
@@ -1007,6 +1042,44 @@ class FileList(ttk.Frame):
         if d:
             self.app._keep("last_tool_dir", os.path.normpath(d))
             self.add_paths([d])
+
+    def _clipboard(self):
+        try:
+            return self.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def can_paste(self):
+        text = self._clipboard()
+        found = found_from_clipboard(text)
+        if found is not None:
+            return any(rel.lower().endswith(tuple(self.td["exts"])) for rel, _w in found)
+        return any(os.path.exists(p.strip().strip('"')) for p in text.splitlines()[:50] if p.strip())
+
+    def paste(self):
+        """Ctrl+V: files copied in Search Files (or paths copied as text) go into the list; only
+        the ones this tool takes. Files in packages or maps are written to the cache first."""
+        text = self._clipboard()
+        found = found_from_clipboard(text)
+        if found is None:
+            paths = [p.strip().strip('"') for p in text.splitlines() if p.strip()]
+            paths = [p for p in paths if os.path.exists(p)]
+            if paths:
+                self.add_paths(paths)
+            return "break"
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            paths, failed = pipeline.stage_found(found, self.td["exts"], os.path.join(config.CACHE_DIR, "pasted"))
+        finally:
+            self.configure(cursor="")
+        for rel in failed:
+            self.app.log(t("fl_paste_fail", f=rel), "warn")
+        if paths:
+            self.add_paths(paths)
+        else:
+            self.app.status.config(text=t("fl_paste_none"))
+        return "break"
 
     def add_paths(self, paths):
         self.configure(cursor="watch")
@@ -1276,14 +1349,7 @@ class FileList(ttk.Frame):
     def _click(self, e):
         """A click anywhere in a switch cell works like a click on its box; a click on a row's
         arrow opens or closes it."""
-        # Tk names the element "image" or "Treeitem.image" (its version decides)
-        if self.tree.identify_region(e.x, e.y) == "tree" and \
-                self.tree.identify_element(e.x, e.y).split(".")[-1] == "image":
-            iid = self.tree.identify_row(e.y)
-            if iid and self.tree.get_children(iid):
-                self.tree.item(iid, open=not self.tree.item(iid, "open"))
-                self._arrows_now()
-                self._boxes_later()
+        if self._arrow_click(e):
             return None
         if self.tree.identify_region(e.x, e.y) != "cell":
             return None
@@ -1310,7 +1376,23 @@ class FileList(ttk.Frame):
             return None
         return r["path"] if os.path.exists(r["path"]) else r["files"][0]
 
+    def _arrow_click(self, e):
+        """Opens or closes the row when the click is on its arrow; True when it was."""
+        # Tk names the element "image" or "Treeitem.image" (its version decides)
+        if self.tree.identify_region(e.x, e.y) != "tree" or \
+                self.tree.identify_element(e.x, e.y).split(".")[-1] != "image":
+            return False
+        iid = self.tree.identify_row(e.y)
+        if iid and self.tree.get_children(iid):
+            self.tree.item(iid, open=not self.tree.item(iid, "open"))
+            self._arrows_now()
+            self._boxes_later()
+        return True
+
     def _double(self, e):
+        # the second click of a quick double click on the arrow opens / closes again
+        if self._arrow_click(e):
+            return "break"
         if self.tree.identify_region(e.x, e.y) not in ("cell", "tree"):
             return None
         p = self._file_of(self.tree.identify_row(e.y))
@@ -1350,6 +1432,9 @@ class FileList(ttk.Frame):
                 menu.add_command(label=t("fl_add_folder"), command=self._add_folder)
             if self.rows:
                 menu.add_command(label=t("fl_clear"), command=self.clear)
+        menu.add_separator()
+        menu.add_command(label=t("menu_paste"), accelerator="Ctrl+V", command=self.paste,
+                         state="normal" if self.can_paste() else "disabled")
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -1443,6 +1528,9 @@ class App:
         # right click on any text field: cut / copy / paste
         for cls in ("TEntry", "TCombobox"):
             root.bind_class(cls, "<Button-3>", entry_menu, add="+")
+        # Ctrl+V on the Tools tab: copied files go into the open tool's list
+        for seq in ("<Control-v>", "<Control-V>"):
+            root.bind_all(seq, self._paste_files, add="+")
         # the lit taskbar button goes off as soon as the window is in front again
         self._lit = False
         root.bind("<FocusIn>", self._unlight, add="+")
@@ -1453,6 +1541,19 @@ class App:
     # widgets that keep the keyboard focus when clicked; a click anywhere else takes it away from
     # the text field, so its focus ring goes
     _KEEP_FOCUS = ("TEntry", "Entry", "TCombobox", "Text", "TSpinbox", "Spinbox", "Listbox", "Treeview")
+
+    def _paste_files(self, e):
+        try:
+            if e.widget.winfo_class() in ("TEntry", "Entry", "TCombobox", "Text", "TSpinbox", "Spinbox"):
+                return None     # the field pastes its text itself
+            if self.nb.nametowidget(self.nb.select()) is not self.tab_tools:
+                return None
+        except (AttributeError, KeyError, tk.TclError):
+            return None
+        fl = getattr(self, "file_list", None)
+        if fl is not None and fl.winfo_exists() and fl.winfo_ismapped():
+            return fl.paste()
+        return None
 
     def _unlight(self, _e=None):
         if self._lit:
@@ -1817,7 +1918,7 @@ class App:
         try:
             from PIL import Image, ImageDraw, ImageTk
             scale = getattr(self, "_scale", 1.0)
-            size, big = max(11, int(round(12 * scale))), 4
+            size, big = max(13, int(round(14 * scale))), 4
             rgb = tuple(int(MUTED[i:i + 2], 16) for i in (1, 3, 5))
             imgs = []
             for pts in (((0.32, 0.2), (0.32, 0.8), (0.74, 0.5)),       # closed: points right
@@ -2009,12 +2110,16 @@ class App:
         self.tab_missing = ttk.Frame(self.nb, style="Card.TFrame")
         self.tab_search = ttk.Frame(self.nb, style="Card.TFrame")
         self.tab_tools = ttk.Frame(self.nb, style="Card.TFrame")
+        self.tab_addons = ttk.Frame(self.nb, style="Card.TFrame")
         self.tab_settings = ttk.Frame(self.nb, style="Card.TFrame")
         self.tab_help = ttk.Frame(self.nb, style="Card.TFrame")
         for tab, key in ((self.tab_port, "tab_port"), (self.tab_missing, "tab_missing"),
                          (self.tab_search, "tab_search"), (self.tab_tools, "tab_tools"),
-                         (self.tab_settings, "tab_settings"), (self.tab_help, "tab_help")):
+                         (self.tab_addons, "tab_addons"), (self.tab_settings, "tab_settings"),
+                         (self.tab_help, "tab_help")):
             self.nb.add(tab, text=f"  {t(key)}  ")
+        # the addon list is read when its tab is opened (sizes take a while on big addons)
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._addons_tab_shown(), add="+")
         # files dropped on a tab (not on one of its parts) go here
         self.tab_port.drop_paths = self._drop_maps
         self.tab_tools.drop_paths = lambda paths: self.file_list.add_paths(paths) if self.file_list else None
@@ -2029,6 +2134,7 @@ class App:
         self._build_missing_tab()
         self._build_search_tab()
         self._build_tools_tab()
+        self._build_addons_tab()
         self._build_settings_tab()
         self._build_help_tab()
         self._refresh_addons()
@@ -2337,7 +2443,7 @@ class App:
         lab.pack(side="left")
         ToolTip(lab, t("port_addon_tip"))
         self.v_addon = tk.StringVar()
-        self.cb_addon = ttk.Combobox(row, textvariable=self.v_addon, width=34)
+        self.cb_addon = ttk.Combobox(row, textvariable=self.v_addon, width=34, postcommand=self._list_addons)
         self.cb_addon.pack(side="left", padx=8)
         ToolTip(self.cb_addon, t("port_addon_tip"))
         self._addon_sync = False
@@ -2368,8 +2474,8 @@ class App:
         row = ttk.Frame(tab, style="Card.TFrame")
         row.pack(fill="x", padx=16)
         ttk.Label(row, text=t("miss_addon"), style="Card.TLabel").pack(side="left")
-        self.v_maddon = tk.StringVar(value=self.cfg.get("miss_addon", ""))
-        self.cb_maddon = ttk.Combobox(row, textvariable=self.v_maddon, width=30)
+        self.v_maddon = tk.StringVar()
+        self.cb_maddon = ttk.Combobox(row, textvariable=self.v_maddon, width=30, postcommand=self._list_addons)
         self.cb_maddon.pack(side="left", padx=(8, 0))
         self.cb_maddon.bind("<<ComboboxSelected>>", lambda e: self._maddon_selected())
         self.cb_maddon.bind("<FocusOut>", lambda e: self._maddon_selected())
@@ -2420,6 +2526,143 @@ class App:
         self.btn_stop3.pack(side="left", padx=8)
         self.table_find = ResultTable(tab, export=self._export_found, with_game=True)
         self.table_find.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+    # --- Addons ----------------------------------------------------------
+    def _build_addons_tab(self):
+        tab = self.tab_addons
+        ttk.Label(tab, text=t("addons_title"), style="Section.TLabel").pack(anchor="w", padx=16, pady=(12, 0))
+        ttk.Label(tab, text=t("addons_info"), style="CardMuted.TLabel", wraplength=1050,
+                  justify="left").pack(fill="x", padx=16, pady=(2, 6))
+        act = ttk.Frame(tab, style="Card.TFrame")
+        act.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Button(act, text=t("addons_refresh"), style="Action.TButton",
+                   command=self._load_addons).pack(side="left")
+        ttk.Button(act, text=t("addons_open"), style="Action.TButton",
+                   command=self._open_addon_folders).pack(side="left", padx=(8, 0))
+        self.btn_addon_del = ttk.Button(act, text=t("addons_delete"), style="Danger.TButton",
+                                        command=self._delete_addons)
+        self.btn_addon_del.pack(side="left", padx=(8, 0))
+        self.lbl_addons = ttk.Label(act, text="", style="CardMuted.TLabel")
+        self.lbl_addons.pack(side="left", padx=12)
+        wrap = ttk.Frame(tab, style="Card.TFrame")
+        wrap.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        cols = ("name", "maps", "size", "date")
+        self.addon_tree = tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
+        for c, w, stretch in (("name", 220, False), ("maps", 420, True), ("size", 100, False), ("date", 150, False)):
+            tree.heading(c, text=t("addons_col_" + c), anchor="w", command=lambda c=c: self._sort_addons(c))
+            tree.column(c, width=int(w * self._scale), stretch=stretch, anchor="w")
+        ys = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ys.set)
+        tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="left", fill="y")
+        tree.bind("<Delete>", lambda e: self._delete_addons())
+        tree.bind("<Double-1>", lambda e: self._open_addon_folders())
+        self._addon_rows = {}
+        self._addon_sort = ("name", False)
+        self._addon_gen = 0
+        if self.nb.select() == str(tab):
+            self._load_addons()
+
+    def _addons_tab_shown(self):
+        if getattr(self, "tab_addons", None) is not None and self.nb.select() == str(self.tab_addons):
+            self._load_addons()
+
+    def _load_addons(self):
+        """Reads the addons in the background (folder sizes); the list fills when it is done."""
+        cs2 = self.cfg.get("cs2_dir", "")
+        self._addon_gen += 1
+        gen = self._addon_gen
+        if not config.is_valid_cs2(cs2):
+            self._addons_loaded(gen, [])
+            self.lbl_addons.config(text=t("addons_no_cs2"))
+            return
+        self.lbl_addons.config(text=t("addons_reading"))
+
+        def work():
+            rows = []
+            for n in addonsmod.names(cs2):
+                try:
+                    rows.append(addonsmod.info(cs2, n))
+                except OSError:
+                    continue
+            self.queue.put(("addons", gen, rows))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _addons_loaded(self, gen, rows):
+        tree = getattr(self, "addon_tree", None)
+        if gen != self._addon_gen or tree is None or not tree.winfo_exists():
+            return
+        keep = set(tree.selection())
+        self._addon_rows = {r["name"]: r for r in rows}
+        self.lbl_addons.config(text=t("addons_count", n=len(rows),
+                                      size=_human_size(sum(r["size"] for r in rows))))
+        self._fill_addons(keep)
+
+    def _fill_addons(self, keep=()):
+        tree = self.addon_tree
+        tree.delete(*tree.get_children())
+        col, rev = self._addon_sort
+        key = {"name": lambda r: r["name"].lower(), "maps": lambda r: (len(r["maps"]), r["name"].lower()),
+               "size": lambda r: r["size"], "date": lambda r: r["mtime"]}[col]
+        for r in sorted(self._addon_rows.values(), key=key, reverse=rev):
+            date = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"])) if r["mtime"] else ""
+            tree.insert("", "end", iid=r["name"], values=(r["name"], ", ".join(r["maps"]) or "-",
+                                                          _human_size(r["size"]), date))
+        sel = [i for i in keep if tree.exists(i)]
+        if sel:
+            tree.selection_set(sel)
+
+    def _sort_addons(self, col):
+        cur, rev = self._addon_sort
+        self._addon_sort = (col, not rev if col == cur else col in ("size", "date"))
+        self._fill_addons(self.addon_tree.selection())
+
+    def _open_addon_folders(self):
+        if not self.addon_tree.selection():
+            cs2 = self.cfg.get("cs2_dir", "")
+            for base in addonsmod.roots(cs2) if cs2 else ():
+                if os.path.isdir(base):
+                    open_in_explorer(base)
+                    break
+            return
+        for name in self.addon_tree.selection()[:4]:
+            r = self._addon_rows.get(name)
+            if r and r["folders"]:
+                open_in_explorer(r["folders"][0])
+
+    def _delete_addons(self):
+        names = list(self.addon_tree.selection())
+        if not names or str(self.btn_addon_del.cget("state")) == "disabled":
+            return
+        if not self._ask(t("addons_delete"), t("addons_delete_ask", list="\n".join(names[:20]) +
+                                               ("\n..." if len(names) > 20 else "")), "warning"):
+            return
+        cs2 = self.cfg.get("cs2_dir", "")
+        self.btn_addon_del.config(state="disabled")
+        self.lbl_addons.config(text=t("addons_deleting"))
+
+        def work():
+            left = []
+            for n in names:
+                try:
+                    left += addonsmod.delete(cs2, n)
+                except ValueError:
+                    continue
+            self.queue.put(("addons_deleted", names, left))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _addons_deleted(self, names, left):
+        if self.btn_addon_del.winfo_exists():
+            self.btn_addon_del.config(state=self.btn_port.cget("state"))
+        gone = [n for n in names if not any(os.path.basename(p) == n for p in left)]
+        if gone:
+            self.log(t("addons_deleted", list=", ".join(gone)), "ok")
+        if left:
+            self._msg(t("addons_delete"), t("addons_left", list="\n".join(left)), "warning")
+        self._list_addons()
+        self._load_addons()
 
     # --- Tools -----------------------------------------------------------
     def _build_tools_tab(self):
@@ -2476,7 +2719,7 @@ class App:
                 ttk.Combobox(of, textvariable=self.v_to, values=list(tools.IMAGE_OUT), state="readonly",
                              width=8).pack(side="left", padx=(6, 20))
                 self.v_to.trace_add("write", lambda *a: self._keep_tool_opts(td))
-            for key, label in (("overwrite", "tool_overwrite"),):
+            for key, label in (("overwrite", "tool_overwrite"), ("find_background", "tool_find_bg")):
                 if key in opts:
                     v = tk.BooleanVar(value=bool(sopts.get(key, opts[key])))
                     self.tool_vars[key] = v
@@ -2645,19 +2888,21 @@ class App:
 
         ttk.Label(g, text=t("set_options"), style="Section.TLabel").grid(row=r, column=0, sticky="w", pady=(16, 4))
         r += 1
-        # two columns: what is written and how (left), what the map gets (right)
+        # what is written and how (left), what the map gets (right, in two columns sharing the
+        # rest of the width)
         of = ttk.Frame(g, style="Card.TFrame")
         of.grid(row=r, column=0, columnspan=3, sticky="ew")
-        of.columnconfigure(0, weight=1, uniform="opts")
-        of.columnconfigure(1, weight=1, uniform="opts")
+        of.columnconfigure(1, weight=1)
         left = ttk.Frame(of, style="Card.TFrame")
         left.grid(row=0, column=0, sticky="nw")
         right = ttk.Frame(of, style="Card.TFrame")
-        right.grid(row=0, column=1, sticky="nw", padx=(24, 0))
+        right.grid(row=0, column=1, sticky="new", padx=(24, 0))
+        right.columnconfigure(0, weight=1, uniform="look")
+        right.columnconfigure(1, weight=1, uniform="look")
         self.opt_vars = {}
         tips = {"light_probes": "opt_light_probes_tip", "post_processing": "opt_post_processing_tip",
-                "bhop_blocks": "opt_bhop_blocks_tip", "sky_moondome": "opt_sky_moondome_tip",
-                "model_placeholder": "opt_model_placeholder_tip"}
+                "bhop_blocks": "opt_bhop_blocks_tip", "sky_moondome": "opt_sky_moondome_tip", "sun_in_sky": "opt_sun_in_sky_tip", "sky3d": "opt_sky3d_tip",
+                "model_placeholder": "opt_model_placeholder_tip", "mip_fade": "opt_mip_fade_tip"}
 
         def add_opt(parent, key, label, pad=0):
             v = tk.BooleanVar(value=bool(self.cfg["opts"].get(key, config.DEFAULTS["opts"].get(key, False))))
@@ -2687,11 +2932,20 @@ class App:
         cb = add_opt(left, "bhop_download", "opt_bhop_download", pad=24)
         ToolTip(cb, t("opt_bhop_download_tip"))
 
-        ttk.Label(right, text=t("set_opts_look"), style="CardMuted.TLabel").pack(anchor="w", pady=(0, 2))
-        for key, label in (("fix_light_brightness", "opt_light_brightness"), ("light_probes", "opt_light_probes"),
-                           ("port_particles", "opt_port_particles"), ("post_processing", "opt_post_processing"),
-                           ("sky_moondome", "opt_sky_moondome"), ("model_placeholder", "opt_model_placeholder")):
-            add_opt(right, key, label)
+        ttk.Label(right, text=t("set_opts_look"), style="CardMuted.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        cols = [ttk.Frame(right, style="Card.TFrame") for _ in range(2)]
+        cols[0].grid(row=1, column=0, sticky="nw")
+        cols[1].grid(row=1, column=1, sticky="nw", padx=(24, 0))
+        # lights and effects | sky and surfaces
+        for col, opts in ((cols[0], (("fix_light_brightness", "opt_light_brightness"),
+                                     ("light_probes", "opt_light_probes"), ("port_particles", "opt_port_particles"),
+                                     ("post_processing", "opt_post_processing"),
+                                     ("model_placeholder", "opt_model_placeholder"))),
+                          (cols[1], (("sky_moondome", "opt_sky_moondome"), ("sun_in_sky", "opt_sun_in_sky"),
+                                     ("sky3d", "opt_sky3d"), ("mip_fade", "opt_mip_fade")))):
+            for key, label in opts:
+                add_opt(col, key, label)
         r += 1
         # work files of the ports (decompiled map, files taken from the .bsp) pile up over time
         ttk.Label(g, text=t("set_work"), style="Section.TLabel").grid(row=r, column=0, sticky="w", pady=(16, 4))
@@ -3183,11 +3437,16 @@ class App:
             self.chip_games.configure(text=text)
         self._chip_tip.text = ", ".join(names) if text != full else ""
 
-    def _refresh_addons(self):
+    def _list_addons(self):
+        """Reads the addon folders again (one made while the program runs shows up too)."""
         cs2 = self.cfg.get("cs2_dir", "")
         addons = config.list_addons(cs2) if config.is_valid_cs2(cs2) else []
         self.cb_addon["values"] = addons
         self.cb_maddon["values"] = addons
+        return addons
+
+    def _refresh_addons(self):
+        self._list_addons()
         if self.v_maddon.get().strip() and not self.v_mmap.get():
             self._maddon_selected()
 
@@ -3451,7 +3710,6 @@ class App:
     def _maddon_selected(self):
         """The map list follows the addon; the map with the addon's name comes first."""
         addon = self.v_maddon.get().strip()
-        self._keep("miss_addon", addon)
         maps = self._addon_maps(addon)
         self.cb_mmap["values"] = maps
         cur = self.v_mmap.get()
@@ -3731,7 +3989,8 @@ class App:
 
     def _set_busy(self, busy):
         st = "disabled" if busy else "normal"
-        for b in (self.btn_port, self.btn_missing, self.btn_tool, self.btn_find):
+        # an addon is not deleted while a job may be writing into it
+        for b in (self.btn_port, self.btn_missing, self.btn_tool, self.btn_find, getattr(self, "btn_addon_del", None)):
             if b is not None and b.winfo_exists():
                 b.config(state=st)
         for b in (self.btn_stop, self.btn_stop2, self.btn_stop3, self.btn_tool_stop):
@@ -3788,6 +4047,10 @@ class App:
                     self._dropped(item[1], item[2])
                 elif kind == "tool_status":
                     self._tool_status(*item[1:])
+                elif kind == "addons":
+                    self._addons_loaded(*item[1:])
+                elif kind == "addons_deleted":
+                    self._addons_deleted(*item[1:])
         except queue.Empty:
             pass
         self.root.after(40 if n else 80, self._poll)
