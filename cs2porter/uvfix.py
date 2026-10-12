@@ -22,6 +22,9 @@ from .blend import _MESH_RE, _array, _block, _close, _stream
 
 _TEX_KEYS = ("TextureColor", "TextureLayer1Color", "TextureNormal", "TextureLayer1Normal")
 _MATS_RE = re.compile(r'"materials" "string_array" *\r?\n[ \t]*\[(.*?)\]', re.S)
+_SEE_THROUGH_RE = re.compile(r'^\s*"?(F_TRANSLUCENT|F_ALPHA_TEST|F_BLEND_MODE)"?\s+"?[1-9]', re.M)
+_SEE_SHADER_RE = re.compile(r'^\s*"?shader"?\s+"(csgo_glass|csgo_refract|csgo_water\w*|tools_wireframe)\.vfx"',
+                            re.M | re.I)
 
 
 class TextureSizes:
@@ -43,6 +46,15 @@ class TextureSizes:
         if key not in self.cache:
             text = self._text(vmat.lower()) or ""
             self.cache[key] = bool(re.search(r'^\s*"?F_TEXTURE_ANIMATION"?\s+"?1', text, re.M))
+        return self.cache[key]
+
+    def see_through(self, vmat):
+        """True when the addon's material can be seen through: translucent, alpha tested,
+        blended, glass, refraction, water or wireframe."""
+        key = "see:" + vmat.lower()
+        if key not in self.cache:
+            text = self._text(vmat.lower()) or ""
+            self.cache[key] = bool(_SEE_THROUGH_RE.search(text) or _SEE_SHADER_RE.search(text))
         return self.cache[key]
 
     def _text(self, vmat):

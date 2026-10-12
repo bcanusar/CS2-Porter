@@ -45,6 +45,7 @@ _TOKEN_RE = re.compile(r'"(?:[^"\\]|\\.)*"|[{}\[\],]')
 
 HELPER_NAMES = ("!activator", "!self", "!caller")
 TELEPORT_KEY = "cs2porter_teleport"
+STRIP_KEY = "cs2porter_strip"
 
 
 class Fixes:
@@ -83,6 +84,8 @@ class Fixes:
         # sprite material -> its converted texture ('materials/x.tga'): glows draw with it
         self.sprite_textures = sprite_textures or {}
         self.glow_particles = {}            # filled by the glow step: vpcf -> texture
+        # filled by the glow / beam steps: (names, input mapping) renamed in every file
+        self.renames = []
         # infodecals and the faces they sit on (vmf.decal_surfaces)
         self.decals = decals or []
         # main map of a 3D skybox: the skybox map its skybox_reference shows ('maps/x.vmap')
@@ -127,22 +130,21 @@ def _pos_key(values):
 # Text structure helpers
 # ---------------------------------------------------------------------------
 
-def _close(text, open_pos):
-    """Index just after the bracket/brace that closes the one at open_pos."""
-    depth = 0
-    for m in _TOKEN_RE.finditer(text, open_pos):
-        tok = m.group(0)
-        if tok in "{[":
-            depth += 1
-        elif tok in "}]":
-            depth -= 1
-            if depth == 0:
-                return m.end()
-    raise ValueError("unbalanced brackets")
+# index just after the bracket/brace that closes the one at open_pos
+_close = blendmod._close
+
+
+# (text, span) of the last _world_children call: the steps often ask again for the same text,
+# and the scan goes over the whole map (one tuple, so threads always see a matching pair)
+_world_last = (None, None)
 
 
 def _world_children(text):
     """(start, end) of the inside of the world's children array."""
+    global _world_last
+    last = _world_last
+    if last[0] is text:
+        return last[1]
     w = text.find('"world" "CMapWorld"')
     if w < 0:
         raise ValueError("no world")
@@ -150,7 +152,9 @@ def _world_children(text):
     if not m:
         raise ValueError("no world children")
     end = _close(text, m.end() - 1)
-    return m.end(), end - 1
+    span = (m.end(), end - 1)
+    _world_last = (text, span)
+    return span
 
 
 _REF_ELEM_RE = re.compile(r'"element"[ \t]+"([^"]*)"')
@@ -185,12 +189,14 @@ def _split_elements(text, start, end):
     elem_start = None
     pos = start
     while True:
-        m = _TOKEN_RE.search(text, pos, end)
+        # between elements the next string starts one; inside one only brackets matter
+        between = depth == 0 and elem_start is None
+        m = (_TOKEN_RE if between else blendmod._BRACKET_RE).search(text, pos, end)
         if not m:
             break
         pos = m.end()
-        tok = m.group(0)
-        if depth == 0 and tok.startswith('"') and elem_start is None:
+        tok = m.group(0) if between else m.group(1)
+        if between and tok.startswith('"'):
             line_start = max(text.rfind("\n", start, m.start()) + 1, start)
             null = _REF_ELEM_RE.match(text, m.start(), end)
             if null:
@@ -530,6 +536,12 @@ def rewrite_connections(text, bhop, attributes):
             counts[0] += 1
             new = _set(_set(_set(fields, "targetName", BHOP_CASE), "inputName", "InValue"),
                        "overrideParam", f"{_BHOP_KEYS[key]} {value}".strip())
+            return _conn_text(ind, new)
+        if key == STRIP_KEY:
+            # added by vmf.fix_for_cs2 for the outputs that sent Strip to a player_weaponstrip
+            counts[0] += 1
+            new = _set(_set(_set(fields, "targetName", BHOP_CASE), "inputName", "InValue"),
+                       "overrideParam", "strip")
             return _conn_text(ind, new)
         if key == TELEPORT_KEY:
             # added by vmf.fix_for_cs2 to trigger_teleports with a landmark
@@ -1163,7 +1175,8 @@ def _edit_text(text, fx, table, stats):
     except ValueError:
         pass
     from . import vmap_ents as ents
-    for name, step in (("glows", lambda tx: ents.convert_glows(tx, stats, fx.sprite_textures, fx.glow_particles)),
+    for name, step in (("glows", lambda tx: ents.convert_glows(tx, stats, fx.sprite_textures, fx.glow_particles,
+                                                                getattr(fx, "renames", None))),
                        ("effects", lambda tx: ents.set_effects(tx, fx.effects, stats)),
                        ("entities", lambda tx: ents.convert_elements(tx, fx, stats)),
                        ("ambients", lambda tx: ents.set_ambient_events(tx, fx.ambients, stats)),
@@ -1218,6 +1231,8 @@ def _paint(text, fx, stats):
             text = uvfix.fix_animated_uvs(text, fx.uv_sizes, stats)
         except (ValueError, IndexError, KeyError) as e:
             stats.setdefault("errors", []).append(f"anim uv: {e}")
+        from .vmap_ents import see_through_meshes
+        text = see_through_meshes(text, fx.uv_sizes, stats)
     if fx.sky_map:
         # last: the edits before work in the original map's places
         try:
@@ -1300,8 +1315,17 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
                            "detail_groups", "effects", "preset_faces"), 0)
     res.stats = stats
     orig = dict(texts)
+    fx.renames = []
     for path in files:
         texts[path] = _edit_text(texts[path], fx, table, stats)
+    if fx.renames and len(files) > 1:
+        # glows and beams get their inputs renamed in their own file above; outputs sent to them
+        # from the map's other files (prefabs) are renamed here
+        from . import vmap_ents as ents
+        for path in files:
+            for names, mapping in fx.renames:
+                if names:
+                    texts[path] = ents.rename_inputs(texts[path], names, mapping)
     res.bhop_outputs = stats["bhop"]
     want_script = bool(fx.bhop and stats["bhop"])
     added = []
@@ -1477,6 +1501,8 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
         log(t("vm_water", n=stats["water"]), "ok")
     if stats.get("underwater"):
         log(t("vm_underwater", n=stats["underwater"]), "ok")
+    if stats.get("see_through"):
+        log(t("vm_see_through", n=stats["see_through"]), "ok")
     if stats.get("surface_lights"):
         log(t("vm_surface_lights", n=stats["surface_lights"]), "ok")
     if stats["ambients"]:

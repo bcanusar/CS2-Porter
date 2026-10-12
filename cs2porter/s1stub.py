@@ -12,6 +12,7 @@ output is identical to the one made with the real textures).
 
 import io
 import os
+import re
 import shutil
 import struct
 
@@ -82,8 +83,25 @@ def _texture_size(sources, tex):
         return None
 
 
-def build_stub_game(work_dir, sources, materials, skyname="", aliases=None):
-    """Returns the gameinfo folder (.../csgo) and the number of prepared materials."""
+# a material found nowhere gets a stand-in of this size (its decal or face would come out 2 units
+# big and turned the wrong way): the size the compiled map has for it, else one its name gives
+# ("decal_256_0001"), else the usual decal size
+MISSING_SIZE = 128
+_NAME_SIZE_RE = re.compile(r"(?:^|[_/x-])(16|32|64|128|256|512|1024|2048)(?=$|[_x-])")
+
+
+def _missing_size(mat, sizes):
+    if mat in (sizes or {}):
+        return sizes[mat]
+    m = _NAME_SIZE_RE.search(mat.rsplit("/", 1)[-1])
+    n = int(m.group(1)) if m else MISSING_SIZE
+    return n, n
+
+
+def build_stub_game(work_dir, sources, materials, skyname="", aliases=None, sizes=None, decals=()):
+    """Returns the gameinfo folder (.../csgo) and the number of prepared materials.
+    sizes: {material: (width, height)} the compiled map has (bsp.BSPInfo.texture_sizes), for
+    the materials that are found nowhere; decals: the infodecal materials among them."""
     root = os.path.join(work_dir, "s1game")
     shutil.rmtree(root, ignore_errors=True)
     gi = os.path.join(root, "csgo")
@@ -126,6 +144,17 @@ def build_stub_game(work_dir, sources, materials, skyname="", aliases=None):
             # a map that names a material "materials/<x>" packs it as materials/materials/<x>
             data, _src = sources.read("materials/" + rel)
             if data is None:
+                mat = rel[len("materials/"):-len(".vmt")]
+                if mat and not mat.startswith(("skybox/", "tools/")) and rel not in written_vmt:
+                    # found nowhere: a plain stand-in, so the importer still builds its decal /
+                    # face at a real size (it stays missing for the port)
+                    written_vmt.add(rel)
+                    extra = '\t"$decal" "1"\n' if mat in (decals or ()) else ""
+                    put(rel, f'"LightmappedGeneric"\n{{\n\t"$basetexture" "{mat}"\n{extra}}}\n'.encode())
+                    if mat not in written_tex:
+                        written_tex.add(mat)
+                        put(f"materials/{mat}.vtf", _vtf_stub(*_missing_size(mat, sizes)))
+                    count += 1
                 continue
         try:
             vmt = parse_vmt(data, rel, loader)
@@ -148,6 +177,16 @@ def build_stub_game(work_dir, sources, materials, skyname="", aliases=None):
                 continue
             written_tex.add(tex)
             put(f"materials/{tex}.vtf", _vtf_stub(*size))
+        mat = rel[len("materials/"):-len(".vmt")]
+        if mat in (decals or ()) and mat not in written_tex:
+            # the importer sizes an infodecal by the texture named like its material, so a
+            # decal whose texture has another name (cs_havana/ivy06a -> cs_italy/ivy06a)
+            # came out 2 units big
+            base = norm_tex(vmt.get("$basetexture") or "")
+            size = _texture_size(sources, base) if base else None
+            if size:
+                written_tex.add(mat)
+                put(f"materials/{mat}.vtf", _vtf_stub(*size))
         count += 1
 
     # stand-in materials ({alias: real}): a plain VMT and texture under the alias name with

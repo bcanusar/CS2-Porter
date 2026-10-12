@@ -156,6 +156,32 @@ class BSPInfo:
             out.append(ent)
         return out
 
+    def texture_sizes(self):
+        """{lower case material: (width, height)} of the textures the map's faces and overlays
+        were compiled with (vbsp writes them into the texdata lump)."""
+        try:
+            texdata = self.read_lump(LUMP_TEXDATA)
+            strdata = self.read_lump(LUMP_TEXDATA_STRING_DATA)
+            strtab = self.read_lump(LUMP_TEXDATA_STRING_TABLE)
+        except Exception:  # noqa: BLE001 - no sizes, the import guesses as before
+            return {}
+        out = {}
+        for i in range(len(texdata) // 32):
+            try:
+                sid, w, h = struct.unpack_from("<3i", texdata, i * 32 + 12)
+                off = struct.unpack_from("<i", strtab, sid * 4)[0]
+                name = strdata[off:strdata.index(b"\0", off)].decode("latin-1").lower().replace("\\", "/")
+            except (struct.error, ValueError, IndexError):
+                continue
+            if not name or not (0 < w <= 16384 and 0 < h <= 16384):
+                continue
+            out[name] = (w, h)
+            # vbsp's own copies (cubemap / blend patches) are maps/<map>/<material>_x_y_z
+            if name.startswith("maps/") and name.count("/") >= 2:
+                base = re.sub(r"(_wvt_patch|(_-?\d+){3})$", "", name.split("/", 2)[2])
+                out.setdefault(base, (w, h))
+        return out
+
     def brushes(self):
         """{frozenset of plane keys: (contents, {plane key: texture})} for every brush of the map
         (bevel sides left out, lower case texture names). See plane_key()."""

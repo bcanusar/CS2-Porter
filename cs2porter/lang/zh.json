@@ -299,8 +299,8 @@
  "miss_addon": "插件",
  "miss_map": "地图",
  "miss_need_map": "请选择一个插件和它的一张地图。",
- "vf_effects": "{n} 个 env_steam / func_dustmotes / func_dustcloud / env_embers / point_spotlight / beam_spotlight / env_spritetrail / func_smokevolume / env_smoketrail / env_fire 已变为粒子系统",
- "vm_effects": "  {n} 个 env_steam / func_dustmotes / func_dustcloud / env_embers / point_spotlight / beam_spotlight / env_spritetrail / func_smokevolume / env_smoketrail / env_fire 已变为 info_particle_system",
+ "vf_effects": "{n} 个 env_steam / func_dustmotes / func_dustcloud / env_embers / point_spotlight / beam_spotlight / env_spritetrail / func_smokevolume / env_smoketrail / env_fire / env_spark / env_smokestack / point_tesla 已变为粒子系统",
+ "vm_effects": "  {n} 个 env_steam / func_dustmotes / func_dustcloud / env_embers / point_spotlight / beam_spotlight / env_spritetrail / func_smokevolume / env_smoketrail / env_fire / env_spark / env_smokestack / point_tesla 已变为 info_particle_system",
  "vm_cables_black": "  {n} 条绳索改用黑色线缆材质（materials/cs2porter/cable_black.vmat）：其材质未找到，或在 CS2 中显示异常（cable/cable）",
  "vm_ropes_removed": "  已删除 {n} 条只有一个点的绳索（它们不显示任何东西）",
  "vm_detail_groups": "  {n} 个 func_detail 组已变为普通网格",
@@ -604,7 +604,7 @@
  "help_h1": "使用方法",
  "help_p1": "1. 在“移植地图”页面添加地图（.bsp 或 .vmf）。也可以把文件、文件夹或压缩包（.zip、.rar、.7z）拖到列表中。\n2. 选择一张地图，从列表中选择它的插件，或输入新名称。每张地图都可以放进不同的插件。\n3. “移植设置”会打开改变地图移植方式的选项。\n4. 点击移植。同时移植两张地图，一张完成后下一张立即开始。完成的地图在列表中变为绿色。在 Hammer 中打开插件并载入地图。",
  "help_h2": "自动修正",
- "help_p2": "• 天空、灯光、绳索、水、声音和发光精灵会变成 CS2 版本。每个发光精灵保留自己的纹理和大小。\n• CS2 没有的实体会变成功能相同的实体，或被移除。火焰会变成 CS2 自带的火焰效果。\n• 没有输入输出的 func_detail 和画刷实体会变成普通网格。\n• 用 clip 纹理做的隐形墙仍然是玩家 clip。\n• 混合置换保留混合效果，纹理保持原位。\n• 贴花贴在它所附着的表面上。\n• 动画纹理继续播放。\n• 灯光（包括太阳）保持 Source 1 中的亮度。\n• 地图会添加光照探针体积，每个体积在看不见的地方有一个小的白色光照房间；体积之间略有重叠并平滑过渡。\n• 在 Source 1 中像灯一样照亮地图的材质（纹理光源）在 CS2 中发光，烘焙光照时给出相同的光。\n• 地图的粒子系统（自带的和游戏的）会变成 CS2 粒子系统。\n• 使用 refract 着色器的玻璃会获得在 CS2 中可用的模糊、深色外观。\n• 用立方体纹理绘制的天空会变成普通的 CS2 天空，显示它的表面会看向天空。\n• 地图的颜色校正会加入后期处理，水下时镜头会获得跟随水体形状的水下效果。\n• 在 Source 1 中照亮周围的水面上方会放置灯光。\n• Bhop 地图会按照 CS2 服务器的要求加入 bhop 脚本、bhop 方块、计时区域和出生点。\n• 太阳 (env_sun) 会画到天空纹理中, 位于地图显示它的位置。\n• 3D 天空盒会变成单独的天空盒地图, 由主地图在周围显示。\n• 在 Source 1 中远处会消失的纹理 (例如网格线) 会在大约相同的距离渐隐。\n• 让墙面变暗和变亮的涂鸦贴花保持透明。\n• 移植结束时会告诉你哪些地方需要在 Hammer 中查看。",
+ "help_p2": "• 天空、灯光、绳索、水、声音和发光精灵会变成 CS2 版本。每个发光精灵保留自己的纹理和大小。\n• CS2 没有的实体会变成功能相同的实体，或被移除。火焰会变成 CS2 自带的火焰效果。\n• 没有输入输出的 func_detail 和画刷实体会变成普通网格。\n• 用 clip 纹理做的隐形墙仍然是玩家 clip。\n• 混合置换保留混合效果，纹理保持原位。\n• 贴花贴在它所附着的表面上。\n• 动画纹理继续播放。\n• 灯光（包括太阳）保持 Source 1 中的亮度。\n• 地图会添加光照探针体积，每个体积在看不见的地方有一个小的白色光照房间；体积之间略有重叠并平滑过渡。\n• 在 Source 1 中像灯一样照亮地图的材质（纹理光源）在 CS2 中发光，烘焙光照时给出相同的光。\n• 地图的粒子系统（自带的和游戏的）会变成 CS2 粒子系统。\n• 使用 refract 着色器的玻璃会获得在 CS2 中可用的模糊、深色外观。\n• 用立方体纹理绘制的天空会变成普通的 CS2 天空，显示它的表面会看向天空。\n• 地图的颜色校正会加入后期处理，水下时镜头会获得跟随水体形状的水下效果。\n• 在 Source 1 中照亮周围的水面上方会放置灯光。\n• Bhop 地图会按照 CS2 服务器的要求加入 bhop 脚本、bhop 方块、计时区域和出生点。\n• 太阳 (env_sun) 会画到天空纹理中, 位于地图显示它的位置。\n• 3D 天空盒会变成单独的天空盒地图, 由主地图在周围显示。\n• 在 Source 1 中远处会消失的纹理 (例如网格线) 会在大约相同的距离渐隐。\n• 让墙面变暗和变亮的涂鸦贴花保持透明。\n• 激光和光束会像 Source 1 中一样滚动。火花（env_spark）、烟囱（env_smokestack）和电弧（point_tesla）会变成与原版相似的粒子系统。\n• 线框材质保留颜色；CS2 中有但显示错误的材质会从 Source 1 获取。\n• 用其他着色器制作的水（如流动的水）会变成真正的 CS2 水。\n• 透明网格（玻璃、格栅、水）不会遮挡可见性。\n• 收缴武器（player_weaponstrip）由 bhop 脚本完成。\n• 移植结束时会告诉你哪些地方需要在 Hammer 中查看。",
  "help_h3": "之后补全缺失资源",
  "help_p3": "在“缺失资源”页面选择插件及其地图并点击 Find Missing：会列出地图使用的、既不在插件中也不在 CS2 中的材质和模型，插件中模型使用的材质也会被检查。“在游戏中搜索”会在已安装的游戏和资源文件夹中查找它们，“添加到插件”会把找到的文件转换到插件中（如果选中了某些行，则只处理这些行）。\n“搜索文件”页面可按名称查找任何文件，找到的文件可以导出到文件夹。导出文件时，会先列出它需要的文件（材质的纹理、模型的部件），由你选择哪些一起导出，然后选择文件夹。",
  "help_h4": "未找到的文件",
@@ -659,5 +659,10 @@
  "p_mip_fade": "远处消失的纹理（{mats}）：{n} 个面切成 {k} 个渐隐的块",
  "p_mip_fade_fail": "无法设置远处消失的纹理：{e}",
  "help_h7": "插件",
- "help_p7": "「插件」标签页列出你的插件及其地图、大小和最后修改时间。「打开文件夹」打开选中的插件 (未选中时打开存放所有插件的文件夹), 「删除」将插件移到回收站。"
+ "help_p7": "「插件」标签页列出你的插件及其地图、大小和最后修改时间。「打开文件夹」打开选中的插件 (未选中时打开存放所有插件的文件夹), 「删除」将插件移到回收站。",
+ "m_wireframe": "线框（以其自身颜色绘制）",
+ "m_cs2_broken": "CS2 中此材质的副本显示有误，已转换原始材质",
+ "vf_weaponstrip": "{n} 个 player_weaponstrip 输出改为发送到 bhop 脚本（strip）",
+ "vf_sky_nodraw": "天空画刷上的 {n} 个 nodraw 面改为天空（天空光可以照进来）",
+ "vm_see_through": "  {n} 个透明网格（玻璃、格栅等）已设为 Not a Vis Contributor"
 }

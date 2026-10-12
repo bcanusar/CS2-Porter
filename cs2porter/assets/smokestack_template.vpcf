@@ -1,0 +1,142 @@
+<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:vpcf66:version{dd571be4-586e-4f41-8b2d-5bbc969e1c53} -->
+{
+	_class = "CParticleSystemDefinition"
+	m_nBehaviorVersion = 12
+	m_nMaxParticles = $max_particles
+	m_flMaxDrawDistance = $draw_distance
+	m_flConstantRadius = $radius
+	m_controlPointConfigurations =
+	[
+		{
+			m_name = "preview"
+			m_drivers =
+			[
+				{
+					m_iAttachType = "PATTACH_WORLDORIGIN"
+					m_entityName = "self"
+				},
+			]
+		},
+	]
+	m_Emitters =
+	[
+		{
+			_class = "C_OP_ContinuousEmitter"
+			m_flEmitRate =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $rate
+			}
+		},
+	]
+	m_Initializers =
+	[
+		{
+			_class = "C_INIT_CreateWithinSphereTransform"
+			m_fRadiusMax = $spread
+			m_vecDistanceBias = [ 1.0, 1.0, 0.0 ]
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $life
+			}
+			m_nOutputField = 1
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $radius
+			}
+			m_nOutputField = 3
+		},
+		{
+			_class = "C_INIT_RandomRotation"
+			m_flDegreesMin = 0.0
+			m_flDegreesMax = 360.0
+		},
+		{
+			_class = "C_INIT_RandomRotationSpeed"
+			m_flDegreesMin = 0.0
+			m_flDegreesMax = $roll
+		},
+		{
+			_class = "C_INIT_InitFloat"
+			m_InputValue =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $alpha
+			}
+			m_nOutputField = 7
+		},
+		{
+			_class = "C_INIT_RandomColor"
+			m_ColorMin = [ $color ]
+			m_ColorMax = [ $color ]
+		},
+		{
+			_class = "C_INIT_VelocityRandom"
+			m_LocalCoordinateSystemSpeedMin =
+			{
+				m_nType = "PVEC_TYPE_LITERAL"
+				m_vLiteralValue = [ $vel_min ]
+			}
+			m_LocalCoordinateSystemSpeedMax =
+			{
+				m_nType = "PVEC_TYPE_LITERAL"
+				m_vLiteralValue = [ $vel_max ]
+			}
+		},
+	]
+	m_Operators =
+	[
+		{
+			_class = "C_OP_BasicMovement"
+		},
+		{
+			_class = "C_OP_Decay"
+		},
+		{
+			_class = "C_OP_SpinUpdate"
+		},
+		{
+			_class = "C_OP_InterpolateRadius"
+			m_flStartScale = 1.0
+			m_flEndScale = $end_scale
+		},
+		{
+			_class = "C_OP_FadeIn"
+			m_flFadeInTimeMin = 0.2
+			m_flFadeInTimeMax = 0.2
+			m_bProportional = true
+		},
+		{
+			_class = "C_OP_FadeOut"
+			m_flFadeOutTimeMin = 0.5
+			m_flFadeOutTimeMax = 0.5
+			m_bProportional = true
+		},
+	]
+	m_Renderers =
+	[
+		{
+			_class = "C_OP_RenderSprites"
+			m_vecTexturesInput =
+			[
+				{
+					m_hTexture = resource:"$texture"
+				},
+			]
+			m_flSelfIllumAmount =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = $self_illum
+			}
+$blend			m_nFeatheringMode = "PARTICLE_DEPTH_FEATHERING_ON_OPTIONAL"
+		},
+	]
+}

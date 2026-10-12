@@ -164,6 +164,11 @@ WATER_START_MIN = 15.0
 # csgo_water reflects white (the light probe cubemaps are baked in white rooms) as soon as the
 # reflectance goes up or Fresnel is on: it is kept in 0..0.03 with Fresnel off
 WATER_REFLECTANCE = 0.02
+# csgo_water can not play the frames of an animated normal map (Source 1 water made to move
+# that way): its two normal layers flow instead, with Source 1's usual $scroll1 / $scroll2
+WATER_FRAME_SCROLL = (0.01, 0.01, -0.025, 0.025)
+# water drawn by another shader (%compilewater): as opaque as its texture at this depth
+WATER_SEEN_DEPTH = 64.0
 # Refract materials with a scrolling normal map: csgo_refract has no scroll, so they become a
 # translucent, shiny, scrolling csgo_complex surface tinted with $refracttint
 REFRACT_OPACITY = 0.35
@@ -392,6 +397,20 @@ def fade_vmat(color, tint, fade):
         f"{T}//---- Fog ----", f'{T}g_bFogEnabled "1"', "",
         f"{T}//---- Translucent ----", f'{T}g_flOpacityScale "1.000"',
         f'{T}TextureTranslucency "[1.000000 1.000000 1.000000 0.000000]"', "", "}", ""])
+
+
+def wireframe_vmat(color, alpha=1.0):
+    """tools_wireframe.vfx material like CS2's materials/tools/wireframe_vertex_color.vmat, drawing
+    its lines in color (Source 1 Wireframe draws them in $color) instead of the vertex color."""
+    T = "\t"
+    lines = ["// THIS FILE IS AUTO-GENERATED", "", "Layer0", "{", f'{T}shader "tools_wireframe.vfx"', "",
+             f"{T}F_WIREFRAME 1"]
+    if alpha < 0.999:
+        lines.append(f"{T}F_TRANSLUCENT 1")
+    lines += ["", f'{T}g_DepthBiasAmount "0.005000"', f'{T}g_LineThickness "1.000000"',
+              f'{T}g_OverrideColorFactor "1.000000"',
+              f'{T}g_vOverrideColor "[{color[0]:.6f} {color[1]:.6f} {color[2]:.6f} {alpha:.6f}]"', "}", ""]
+    return "\n".join(lines)
 
 
 def _pow2_up(v):
@@ -734,6 +753,18 @@ def _floats(text, scale=1.0):
     return out
 
 
+def is_water(vmt):
+    """Water shader, or another shader with %compilewater (vbsp makes those brushes water the
+    player swims in; the surface is drawn by the material's own shader)."""
+    return vmt.shader == "water" or vmt.flag("%compilewater")
+
+
+def _animated_vars(vmt):
+    """Texture variables played frame by frame by an AnimatedTexture proxy."""
+    return {(p.get("animatedtexturevar") or "$basetexture").lower()
+            for p in _proxies(vmt) if p.name.lower() == "animatedtexture"}
+
+
 def _water_scroll_proxy(vmt):
     """TextureScroll proxy (rate, angle) -> (dx, dy)."""
     import math
@@ -781,6 +812,7 @@ class MaterialConverter:
         self.convert_cs2_existing = convert_cs2_existing
         self.tex_cache = {}
         self.sprite_textures = {}       # sprite material -> its texture (glow particles use it)
+        self.cs2_broken = set()         # materials CS2 has but draws wrong (converted anyway)
         self.results = {}
         self.extra_textures = 0
         VC.set_base_dir(content_dir)
@@ -964,6 +996,12 @@ class MaterialConverter:
         if mat in self.results:
             return self.results[mat]
         res = self._convert(mat, set(usages))
+        if mat in self.cs2_broken:
+            if res.status == "created":
+                res.detail = f"{res.detail} | {t('m_cs2_broken')}"
+            elif res.status in ("missing", "error", "unsupported"):
+                # no Source 1 material to convert: CS2's own copy is still better than none
+                res = MaterialResult(mat, "cs2", t("m_cs2"), res.source)
         self.results[mat] = res
         return res
 
@@ -980,7 +1018,10 @@ class MaterialConverter:
             return MaterialResult(mat, "exists", t("m_exists"))
         # a texture light needs its own glowing material, also when CS2 has one of that name
         if not self.convert_cs2_existing and self.index.in_cs2(f"{vmat_rel}_c") and mat not in self.texture_lights:
-            return MaterialResult(mat, "cs2", t("m_cs2"))
+            if not self.index.broken_in_cs2(f"{vmat_rel}_c"):
+                return MaterialResult(mat, "cs2", t("m_cs2"))
+            # CS2's material of this name draws wrong: the Source 1 one is converted
+            self.cs2_broken.add(mat)
 
         src, rel = self.find_vmt(mat)
         if src is None:
@@ -1003,10 +1044,18 @@ class MaterialConverter:
             return self._write_fade(mat, vmt, fade, src.label)
         if shader == "windowimposter":
             return self._write_imposter(mat, vmt, src.label)
-        if shader == "water":
+        if is_water(vmt):
             return self._write_water(mat, vmt, src.label)
         if shader == "refract":
             return self._write_refract(mat, vmt, src.label)
+        if shader.startswith("wireframe"):
+            color = vmt_color(vmt) or (1.0, 1.0, 1.0)
+            try:
+                alpha = min(max(float(_floats(vmt.get("$alpha", "1"))[0]), 0.0), 1.0)
+            except IndexError:
+                alpha = 1.0
+            self._save(mat, wireframe_vmat(color, alpha))
+            return MaterialResult(mat, "created", t("m_wireframe"), src.label)
 
         base = vmt.get("$basetexture") or vmt.get("$hdrbasetexture")
         if base and norm_tex(base).startswith("_rt_"):
@@ -1175,6 +1224,30 @@ class MaterialConverter:
         except (OSError, ValueError):
             return WHITE_MASK
 
+    def _water_look(self, vmt):
+        """((r, g, b) 0..1, opacity) of a surface's base texture: its mean color times $color and
+        how see-through it is ($translucent alpha, $alpha). None without a readable texture."""
+        base = norm_tex(vmt.get("$basetexture") or "")
+        src, rel, ext = self.sources.find_texture(base) if base else (None, None, None)
+        if src is None:
+            return None
+        try:
+            data = src.read(rel)
+            img = vtfmod.load_vtf_frames(data)[0][0] if ext == ".vtf" else vtfmod.image_from_bytes(data, ext)
+            img = img.convert("RGBA")
+            img.thumbnail((64, 64))
+            stat = [sum(c) / max(len(c), 1) / 255.0 for c in (list(ch.getdata()) for ch in img.split())]
+        except Exception:  # noqa: BLE001
+            return None
+        tint = vmt_color(vmt) or (1.0, 1.0, 1.0)
+        rgb = tuple(min(max(stat[k] * tint[k], 0.0), 1.0) for k in range(3))
+        opacity = stat[3] if vmt.flag("$translucent") else 1.0
+        try:
+            opacity *= min(max(float(_floats(vmt.get("$alpha", "1"))[0]), 0.0), 1.0)
+        except IndexError:
+            pass
+        return rgb, opacity
+
     def _write_water(self, mat, vmt, source_label):
         """Water shader -> csgo_water.vfx (same mapping as the map importer), with Lightmapped
         Water Fog and Fresnel off and a low reflectance: otherwise the water reflects white."""
@@ -1182,12 +1255,21 @@ class MaterialConverter:
         normal = self.ensure_texture(ntex) if ntex else None
         s1 = (_floats(vmt.get("$scroll1")) + [0.0, 0.0])[:2]
         s2 = (_floats(vmt.get("$scroll2")) + [0.0, 0.0])[:2]
+        scroll = _water_scroll_proxy(vmt)
+        if (not any(s1 + s2) and not scroll and normal
+                and {"$bumpmap", "$normalmap"} & _animated_vars(vmt)):
+            s1, s2 = list(WATER_FRAME_SCROLL[:2]), list(WATER_FRAME_SCROLL[2:])
         try:
             refract = float(_floats(vmt.get("$refractamount", "1"))[0])
         except IndexError:
             refract = 1.0
-        fog_raw = vmt.get("$fogcolor") or "{20 40 45}"
-        fog = _floats(fog_raw, 1 / 255.0) if "{" in fog_raw else _floats(fog_raw)
+        # water drawn by another shader: it looks like its texture, as see-through as that is
+        look = self._water_look(vmt) if vmt.shader != "water" else None
+        fog_raw = vmt.get("$fogcolor") or ""
+        if fog_raw:
+            fog = _floats(fog_raw, 1 / 255.0) if "{" in fog_raw else _floats(fog_raw)
+        else:
+            fog = list(look[0]) if look else []
         fog = (fog + [0.08, 0.15, 0.18])[:3]
         # $reflecttint (the color of the reflection in Source 1) times the water's color
         tint_raw = vmt.get("$reflecttint") or ""
@@ -1199,6 +1281,8 @@ class MaterialConverter:
         s1_end = (_floats(vmt.get("$fogend", "500")) + [500.0])[0]
         fstart = WATER_START_MIN
         fend = fstart + max(s1_end - max(s1_start, 0.0), 1.0)
+        if look and not vmt.get("$fogend"):
+            fend = fstart + WATER_SEEN_DEPTH / max(look[1], 0.05)
         T = "\t"
         lines = ['"Layer0"', "{", f'{T}"Shader"{T}{T}"csgo_water.vfx"']
         if normal:
@@ -1217,7 +1301,6 @@ class MaterialConverter:
             f'{T}"g_flWaterDepth"{T}{T}"{fend:.6f}"',
             f'{T}"g_flWaterStart"{T}{T}"{fstart:.6f}"',
         ]
-        scroll = _water_scroll_proxy(vmt)
         if scroll and (abs(scroll[0]) > 1e-6 or abs(scroll[1]) > 1e-6):
             lines += [f'{T}"DynamicParams"', f"{T}{{",
                       f'{T}{T}"g_vNormalTexCoordOffset"{T}{T}"frac( float2( {scroll[0]:.3f}, {scroll[1]:.3f} ) * time() )"',

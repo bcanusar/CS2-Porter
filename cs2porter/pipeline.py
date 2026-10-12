@@ -450,10 +450,15 @@ def open_sources(cfg, ctx, embedded_dir=None, extra_dirs=(), prefer=None):
     prefer: game mod folders searched first (e.g. ("csgo",) for a CS:GO map)."""
     ctx.log(t("p_sources"), "info")
     # an extra folder is read like a resource folder (game folders and packages in it), and
-    # after the games every other file in it counts too, found by its name
+    # after the games every other file in it (and in the resource folders) counts too, found by
+    # its name
+    res_dirs = [d for d in (cfg.get("resource_dirs") or []) if d and os.path.isdir(d)]
+    loose = list(extra_dirs) + [(d, t("src_resources", name=os.path.basename(os.path.normpath(d))))
+                                for d in res_dirs
+                                if os.path.normcase(d) not in {os.path.normcase(x) for x in extra_dirs}]
     sources = AssetSources(embedded_dir, config.resource_entries(cfg.get("resource_dirs")),
                            config.find_s1_gamedirs(prefer), log=ctx.log,
-                           extra_dirs=config.resource_entries(extra_dirs), loose_dirs=extra_dirs)
+                           extra_dirs=config.resource_entries(extra_dirs), loose_dirs=loose)
     shown = set()
     for s in sources.sources:
         # shorten, so dozens of VPKs of the same game are not listed one by one
@@ -635,8 +640,10 @@ PARTICLES = {
 
 
 # always written again (the program changed them; light_ray.vpcf takes length / width / alpha
-# since 2.12, an older copy would read them as the beam vector)
-OWN_PARTICLES = ("particles/steam_particle.vpcf", "particles/trail_particle.vpcf", "particles/light_ray.vpcf")
+# since 2.12, an older copy would read them as the beam vector; the beam scrolls its texture by
+# data control point 3 z since 2.41)
+OWN_PARTICLES = ("particles/steam_particle.vpcf", "particles/trail_particle.vpcf", "particles/light_ray.vpcf",
+                 "particles/beam_particle.vpcf")
 BOX_SPRITES_TEMPLATE = "box_sprites_template.vpcf"
 SMOKE_TEMPLATE = "smoke_template.vpcf"
 
@@ -735,10 +742,119 @@ def _smoke_blocks(params):
     return {"emitter": emitter, "position": position, "operators": "\n".join(ops)}
 
 
-def generated_particle(params):
-    """Text of a particle made from an assets template (vmf._embers_params ...): box sprites, or
-    smoke when params["_template"] is "smoke"."""
+# the particles made for env_spark / env_smokestack / point_tesla, from their assets templates
+ENTITY_TEMPLATES = {"spark": "spark_template.vpcf", "smokestack": "smokestack_template.vpcf",
+                    "tesla": "tesla_template.vpcf"}
+# a smokestack whose material has no texture to show draws Source 1's usual smoke
+SMOKE_TEXTURE = "materials/particle/vistasmokev1/vistasmokev1_emods.vtex"
+TESLA_TEXTURE = "materials/sprites/physbeam.vtex"
+
+
+def _entity_particle(params, texture=None):
+    """Text of an env_spark / env_smokestack / point_tesla particle (vmf._spark_params ...).
+    texture(material) -> (texture resource or None, additive) for the material they draw with."""
     import string
+    kind = params["_template"]
+    with open(os.path.join(config.ASSETS_DIR, ENTITY_TEMPLATES[kind]), "r", encoding="utf-8") as f:
+        tmpl = string.Template(f.read())
+    vals = {}
+    for k, v in params.items():
+        if k.startswith("_") or v is None:
+            continue
+        if isinstance(v, tuple):
+            vals[k] = ", ".join(str(int(c)) if k.startswith("color") else _num_text(c) for c in v)
+        elif k == "max_particles":
+            vals[k] = str(int(v))
+        else:
+            vals[k] = _num_text(v)
+    vals.setdefault("draw_distance", "5000.0")
+    tex, additive = None, False
+    if kind in ("smokestack", "tesla"):
+        tex, additive = texture(params.get("_material", "")) if texture else (None, False)
+        vals["texture"] = tex or (TESLA_TEXTURE if kind == "tesla" else SMOKE_TEXTURE)
+    if kind == "smokestack":
+        additive = additive and bool(tex)
+        vals["blend"] = '\t\t\tm_nOutputBlendMode = "PARTICLE_OUTPUT_BLEND_MODE_ADD"\n' if additive else ""
+        # glowing (additive) puffs show their own color, smoke is a little lit
+        vals["self_illum"] = "1.0" if additive else "0.5"
+    text = tmpl.substitute(vals)
+    if kind == "smokestack" and not tex:
+        # Source 1's smoke texture keeps its puff shape in the alpha channel
+        text = text.replace(f'm_hTexture = resource:"{SMOKE_TEXTURE}"',
+                            f'm_hTexture = resource:"{SMOKE_TEXTURE}"\n'
+                            '\t\t\t\t\tm_nTextureChannels = "SPRITECARD_TEXTURE_CHANNEL_MIX_A"')
+    return text
+
+
+# Source 1 sparks and tesla arcs come again and again while the entity is on. A burst system
+# ends with its last particle (the restart operator only runs while particles are alive), so,
+# as in Valve's own looping effects, a system with one particle that never dies and is not
+# drawn restarts the burst (its child) after each wait
+LOOP_KINDS = ("spark", "tesla")
+_RESTART_RE = re.compile(r'[ \t]*\{\s*_class = "C_OP_RestartAfterDuration"\s*m_flDurationMin = (\S+)\s*'
+                         r'm_flDurationMax = (\S+)\s*\},\n')
+LOOP_PARENT = """<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:vpcf66:version{dd571be4-586e-4f41-8b2d-5bbc969e1c53} -->
+{
+	_class = "CParticleSystemDefinition"
+	m_nBehaviorVersion = 12
+	m_nMaxParticles = 1
+	m_Emitters =
+	[
+		{
+			_class = "C_OP_InstantaneousEmitter"
+			m_nParticlesToEmit =
+			{
+				m_nType = "PF_TYPE_LITERAL"
+				m_flLiteralValue = 1.0
+			}
+		},
+	]
+	m_Initializers =
+	[
+		{
+			_class = "C_INIT_CreateWithinSphereTransform"
+		},
+	]
+	m_Operators =
+	[
+		{
+			_class = "C_OP_RestartAfterDuration"
+			m_flDurationMin = %s
+			m_flDurationMax = %s
+			m_bOnlyChildren = true
+		},
+	]
+	m_Children =
+	[
+		{
+			m_ChildRef = resource:"%s"
+		},
+	]
+}
+"""
+
+
+def particle_files(rel, params, texture=None):
+    """[(vpcf, text)] written for a generated particle: the particle itself, or for a looping
+    one (LOOP_KINDS) the restarting system under rel and the burst as rel_burst.vpcf."""
+    text = generated_particle(params, texture)
+    if params.get("_template") not in LOOP_KINDS:
+        return [(rel, text)]
+    m = _RESTART_RE.search(text)
+    if not m:
+        return [(rel, text)]
+    burst = rel[:-len(".vpcf")] + "_burst.vpcf"
+    return [(rel, LOOP_PARENT % (m.group(1), m.group(2), burst)),
+            (burst, text[:m.start()] + text[m.end():])]
+
+
+def generated_particle(params, texture=None):
+    """Text of a particle made from an assets template (vmf._embers_params ...): box sprites, or
+    smoke when params["_template"] is "smoke"; the env_spark / env_smokestack / point_tesla ones
+    see _entity_particle."""
+    import string
+    if params.get("_template") in ENTITY_TEMPLATES:
+        return _entity_particle(params, texture)
     if params.get("_template") == "dustmotes":
         # dustmotes.vpcf unchanged except for how far away it is drawn
         with open(os.path.join(config.ASSETS_DIR, "dustmotes.vpcf"), "r", encoding="utf-8") as f:
@@ -770,19 +886,25 @@ def generated_particle(params):
     return tmpl.substitute(vals)
 
 
-def write_particles(ctx, content_dir, kinds, overwrite=False, generated=None):
+def write_particles(ctx, content_dir, kinds, overwrite=False, generated=None, texture=None):
     """Copies the particle systems (and their textures) the converted entities use into the
     addon. kinds: the PARTICLES keys that are needed; generated: {vpcf: (kind, params, key)}
-    of particles made for entity values (always written)."""
+    of particles made for entity values (always written); texture: see generated_particle."""
     for rel, (_kind, params, _key) in sorted((generated or {}).items()):
-        dst = os.path.join(content_dir, *rel.split("/"))
         try:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "w", encoding="utf-8", newline="\n") as f:
-                f.write(generated_particle(params))
-            ctx.log(t("p_particle", f=rel), "ok")
+            files = particle_files(rel, params, texture)
         except (OSError, KeyError, ValueError) as e:
             ctx.log(t("snd_fail", f=rel, e=e), "err")
+            continue
+        for out_rel, text in files:
+            dst = os.path.join(content_dir, *out_rel.split("/"))
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                ctx.log(t("p_particle", f=out_rel), "ok")
+            except OSError as e:
+                ctx.log(t("snd_fail", f=out_rel, e=e), "err")
     for key, files in PARTICLES.items():
         if key not in kinds:
             continue
@@ -809,6 +931,68 @@ def _image_size(path):
             return im.size
     except Exception:  # noqa: BLE001 - the particle keeps its usual size
         return None
+
+
+def particle_textures(cfg, sources, report, content_dir):
+    """fn(material) -> (texture resource, additive) for particles that draw with a Source 1
+    sprite material (env_smokestack's SmokeMaterial, point_tesla's texture): the texture the port
+    converted for it (a .vtex is written next to it), else the compiled texture of CS2's material
+    of that name; None when there is neither. additive: the Source 1 material adds its color."""
+    from .cs2res import texture_refs
+    from .materials import parse_vmt
+    cache, arcs = {}, []
+
+    def cs2_texture(mat):
+        if not arcs:
+            for rel in ("game/csgo/pak01_dir.vpk", "game/core/pak01_dir.vpk"):
+                p = os.path.join(cfg.get("cs2_dir") or "", *rel.split("/"))
+                if cfg.get("cs2_dir") and os.path.isfile(p):
+                    try:
+                        arcs.append(VPKArchive(p))
+                    except (OSError, VPKError):
+                        pass
+            arcs.append(None)       # looked once
+        for arc in arcs:
+            if arc is None:
+                continue
+            vmat_c = f"materials/{out_name(mat)}.vmat_c".lower()
+            if vmat_c in arc.entries:
+                refs = texture_refs(arc.read(vmat_c))
+                if refs:
+                    return refs[0]
+            vtex_c = f"materials/{out_name(mat)}.vtex_c".lower()
+            if vtex_c in arc.entries:
+                return vtex_c[:-2]
+        return None
+
+    def resolve(mat):
+        mat = (mat or "").lower()
+        if mat in cache:
+            return cache[mat]
+        additive = False
+        rel = f"materials/{mat}.vmt"
+        data = sources.read(rel)[0] if mat else None
+        if data:
+            try:
+                vmt = parse_vmt(data, rel, lambda r: sources.read(r)[0])
+                additive = vmt.flag("$additive") or (vmt.get("$spriterendermode") or "").strip() in ("3", "5", "9")
+            except Exception:  # noqa: BLE001 - an unreadable material draws normally
+                additive = False
+        tex = report.sprite_textures.get(mat)
+        if tex:
+            vtex = tex.rsplit(".", 1)[0] + ".vtex"
+            try:
+                with open(os.path.join(content_dir, *vtex.split("/")), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(particlesmod.VTEX_TEMPLATE.replace("$FILE", tex))
+            except OSError:
+                vtex = None
+            tex = vtex
+        if not tex and mat:
+            tex = cs2_texture(mat)
+        cache[mat] = (tex, additive)
+        return cache[mat]
+
+    return resolve
 
 
 def write_glow_particles(ctx, content_dir, glows):
@@ -858,8 +1042,9 @@ def missing_rope_materials(report, ropes):
 
 
 def water_vmats(sources, materials):
-    """'materials/x.vmat' of the map's materials that use the Source 1 water shader."""
-    from .materials import parse_vmt
+    """'materials/x.vmat' of the map's materials that are water (Source 1 water shader or
+    %compilewater)."""
+    from .materials import is_water, parse_vmt
 
     def load(rel):
         return sources.read(rel)[0]
@@ -871,7 +1056,7 @@ def water_vmats(sources, materials):
         if not data or b"water" not in data.lower():
             continue
         try:
-            if parse_vmt(data, rel, load).shader == "water":
+            if is_water(parse_vmt(data, rel, load)):
                 out.add(f"materials/{out_name(mat)}.vmat")
         except Exception:  # noqa: BLE001
             continue
@@ -1415,7 +1600,8 @@ def port_map(cfg, ctx, input_path, addon_name):
         vmfmod.fix_for_cs2(r, sky_alias=sky_alias, attributes=attributes, meshes=meshes,
                            teleport_key=vmapmod.TELEPORT_KEY if bhop_on else None,
                            split_triggers=bool(opts.get("split_triggers", True)), effects=effects,
-                           log=ctx.log if r is root else None, bhop_blocks=blocks, world=tracer)
+                           log=ctx.log if r is root else None, bhop_blocks=blocks, world=tracer,
+                           strip_key=vmapmod.STRIP_KEY if bhop_on else None)
     del tracer
     vmfmod.write_vmf(root, vmf_path)
     if sky3d:
@@ -1454,7 +1640,8 @@ def port_map(cfg, ctx, input_path, addon_name):
         aliases = {sky_alias: vmfmod.SKYBOX_MAT} if sky_alias else None
         refs, imported = _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
                                      vinfo.skyname, map_name, addon, cs2_ok, aliases,
-                                     extra=(sky3d.name,) if sky3d else ())
+                                     extra=(sky3d.name,) if sky3d else (),
+                                     tex_sizes=None if is_vmf else info.texture_sizes())
         if sky3d:
             sky3d.imported = sky3d.name in imported
         ctx.check()
@@ -1552,7 +1739,8 @@ def port_map(cfg, ctx, input_path, addon_name):
             if res.stats.get("effects"):
                 kinds |= set(effects.get("kinds") or {})
             write_particles(ctx, content_dir, kinds, opts.get("overwrite", False),
-                            effects.get("generated") if res.stats.get("effects") else None)
+                            effects.get("generated") if res.stats.get("effects") else None,
+                            particle_textures(cfg, sources, report, content_dir))
             _beam_notice(report, res.stats)
         moved = vmapmod.move_postprocess(content_dir, overwrite=created or opts.get("overwrite", False)) \
             if cs2_ok else 0
@@ -1737,8 +1925,9 @@ def _beam_notice(report, stats):
 
 
 def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials, skyname,
-                map_name, addon, cs2_ok, aliases=None, extra=()):
+                map_name, addon, cs2_ok, aliases=None, extra=(), tex_sizes=None):
     """Imports the map as a .vmap, then the extra maps of the same folder (the 3D skybox).
+    tex_sizes: texture sizes of the compiled map (for materials found nowhere).
     Returns ([paths of the new _refs.txt files], {names of the maps imported})."""
     if not cs2_ok:
         ctx.log(t("p_import_skip_cs2"), "warn")
@@ -1753,7 +1942,8 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
         return [], set()
 
     ctx.log(t("p_import"), "head")
-    gi, n = s1stub.build_stub_game(work, sources, sorted(materials), skyname, aliases)
+    gi, n = s1stub.build_stub_game(work, sources, sorted(materials), skyname, aliases, tex_sizes,
+                                   {m for m, use in materials.items() if "decal" in use})
     ctx.log(t("p_stub", n=n), "dim")
     maps_dir = os.path.join(cfg["cs2_dir"], "content", "csgo_addons", addon, "maps")
     refs, imported = [], set()
@@ -2126,7 +2316,7 @@ def scan_missing(cfg, ctx, vmap, addon_name):
             rel = f"materials/{out_name(name)}.vmat"
         else:
             rel = out_name(name[:-4]) + ".vmdl"
-        if index.in_addon(rel) or index.in_cs2(rel + "_c"):
+        if index.in_addon(rel) or index.in_cs2_working(rel + "_c"):
             if kind == "model" and index.in_addon(rel):
                 model_vmdls.append((name, rel))
             continue
@@ -2138,7 +2328,7 @@ def scan_missing(cfg, ctx, vmap, addon_name):
         ctx.check()
         for vmat in _vmdl_materials(os.path.join(index.content_dir, *rel.split("/"))):
             mat = vmat[len("materials/"):-len(".vmat")]
-            if mat in listed or _is_tool(mat) or index.in_addon(vmat) or index.in_cs2(vmat + "_c"):
+            if mat in listed or _is_tool(mat) or index.in_addon(vmat) or index.in_cs2_working(vmat + "_c"):
                 continue
             listed.add(mat)
             miss_mats.append(mat)

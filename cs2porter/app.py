@@ -587,16 +587,25 @@ class ResultTable(ttk.Frame):
         self._update_summary()
         self._sync_game_col()
 
-    def clear(self):
+    def clear(self, keep_filter=False):
+        """keep_filter: the chosen map / game stays chosen while new rows come in; settle_filter
+        goes back to all when none of them has it."""
         self.rows = []
         self._shown_keys = []
         self.content_dirs = {}
         self.tree.delete(*self.tree.get_children())
-        self._update_summary()
         if self.with_map:
-            self.map_filter.set(self.all_text)
+            if not keep_filter:
+                self.map_filter.set(self.all_text)
             self.cb_map["values"] = [self.all_text]
+        self._update_summary()
         self._sync_game_col()
+
+    def settle_filter(self):
+        """A chosen map / game that no row has any more: all of them are shown."""
+        if self.with_map and self.map_filter.get() not in self.cb_map["values"]:
+            self.map_filter.set(self.all_text)
+            self.refresh()
 
     def _sync_game_col(self):
         """The Game column is only there while a row has a game (search results)."""
@@ -3875,7 +3884,8 @@ class App:
             self._msg(t("tab_search"), t("find_need_text"), "warning")
             return
         exact = self.v_find_mode.get() == "exact"
-        self.table_find.clear()
+        # the game chosen in the last results stays chosen when the new ones have it too
+        self.table_find.clear(keep_filter=True)
         self._start_job(lambda ctx: pipeline.find_files(self.cfg, ctx, query, exact),
                         t("job_find"), self.table_find)
 
@@ -4059,6 +4069,8 @@ class App:
         after, self._job_after = self._job_after, None
         if after is not None and not error:
             after(report)
+        if isinstance(self.current_table, ResultTable):
+            self.current_table.settle_filter()
         self._set_busy(False)
         flash_taskbar(self.root)
         self._lit = True

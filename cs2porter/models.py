@@ -219,6 +219,43 @@ def parse_qc(path):
 # VMDL creation (vmdl_converter.py format)
 # ---------------------------------------------------------------------------
 
+_CHOICE_RE = re.compile(r'\n([ \t]*)_class = "BodyGroupChoice"\n')
+
+
+def name_body_group_choices(text):
+    """The model importer writes body group choices without a name, and the resource compiler
+    refuses the model ("Invalid empty body group choice name"): each choice is named after its
+    first mesh ("empty" when it has none), unique within its body group."""
+    from .blend import _close
+    out, pos = [], 0
+    used = {}
+    for m in _CHOICE_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        start = text.rfind("{", 0, m.start() + 1)
+        if start < 0:
+            continue
+        try:
+            end = _close(text, start)
+        except ValueError:
+            continue
+        block = text[start:end]
+        if re.search(r'\n[ \t]*name = "[^"]+"', block):
+            continue
+        # the body group around it: choices are told apart within it
+        group = text.rfind('_class = "BodyGroup"\n', 0, start)
+        names = used.setdefault(group, set())
+        mesh = re.search(r'meshes =\s*\[\s*"([^"]+)"', block)
+        base = re.sub(r"_lod0$", "", mesh.group(1)) if mesh else "empty"
+        name, n = base, 2
+        while name in names:
+            name, n = f"{base}_{n}", n + 1
+        names.add(name)
+        out += [text[pos:m.end()], f'{m.group(1)}name = "{name}"\n']
+        pos = m.end()
+    return "".join(out) + text[pos:] if out else text
+
+
 def _fmt_scale(s):
     return f"{s:.6g}" if "." in f"{s:.6g}" else f"{s:.6g}.0"
 
@@ -638,6 +675,15 @@ class ModelConverter:
         if not ok or not os.path.isfile(vmdl_abs):
             tail = out.strip().splitlines()[-1] if out.strip() else t("md_no_output")
             return ModelResult(mdl, "error", t("md_valve_fail", tail=tail), src.label)
+        try:
+            with open(vmdl_abs, "r", encoding="utf-8") as f:
+                text = f.read()
+            named = name_body_group_choices(text)
+            if named != text:
+                with open(vmdl_abs, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(named)
+        except OSError:
+            pass
         mats = []
         refs = os.path.join(self.content_dir, *(mdl[:-4] + "_refs.txt").split("/"))
         if os.path.isfile(refs):

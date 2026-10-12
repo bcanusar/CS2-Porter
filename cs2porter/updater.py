@@ -6,6 +6,7 @@ copies the new files over the program folder (settings and the cache are not in 
 they stay) and starts the program again.
 """
 import base64
+import http.client
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -155,10 +157,12 @@ def download(release, progress=None, cancelled=None):
                     if progress is not None:
                         progress(got, total)
             break
-        except OSError:
-            # socket.timeout and URLError are OSError too
+        except (OSError, http.client.HTTPException) as e:
+            # socket.timeout, URLError and a reset connection (WinError 10054) are OSError too;
+            # a cut off answer is an HTTPException
             if attempt == 5:
-                raise
+                raise OSError(str(e)) from e
+            time.sleep(1 + attempt)
     if total and got != total:
         raise OSError(f"the download stopped early ({got} of {total} bytes)")
     out = os.path.join(root, "files")

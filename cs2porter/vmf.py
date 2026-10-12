@@ -2,6 +2,7 @@
 
 import collections
 import math
+import random
 import re
 
 _KV_RE = re.compile(r'^"([^"]*)"\s*"(.*)"\s*$')
@@ -566,6 +567,42 @@ def _teleports_to_bhop(root, teleport_key):
     return count
 
 
+# --- player_weaponstrip ------------------------------------------------------------------
+
+WEAPONSTRIP_INPUTS = ("strip", "stripweaponsandsuit")
+
+
+def _weaponstrips_to_bhop(root, strip_key):
+    """CS2 has no player_weaponstrip: outputs that send it Strip now send 'strip' to the bhop
+    script (through !activator AddOutput here, redirected in the .vmap like the teleports), its
+    other inputs are dropped and the entity is removed. Returns the number of outputs changed."""
+    strips = [e for e in root.children("entity") if e.classname == "player_weaponstrip"]
+    if not strips:
+        return 0
+    names = {(e.get("targetname") or "").strip().lower() for e in strips} - {""}
+    count = 0
+    for ent in root.children("entity"):
+        for conn in ent.children("connections"):
+            kept = []
+            for item in conn.items:
+                if not isinstance(item, list) or len(item) < 2:
+                    kept.append(item)
+                    continue
+                sep = "\x1b" if "\x1b" in item[1] else ","
+                parts = item[1].split(sep)
+                if len(parts) < 2 or parts[0].strip().lower() not in names:
+                    kept.append(item)
+                    continue
+                if parts[1].strip().lower() in WEAPONSTRIP_INPUTS:
+                    rest = (parts[3:] + ["0", "-1"])[:2]
+                    kept.append([item[0], sep.join(["!activator", "AddOutput", strip_key] + rest)])
+                    count += 1
+            conn.items = kept
+    root.items = [i for i in root.items if not (isinstance(i, VNode) and i.name.lower() == "entity"
+                                                and i.classname == "player_weaponstrip")]
+    return count
+
+
 # --- bhop blocks -------------------------------------------------------------------------
 
 BHOP_BLOCK_NAME = "bhop_block"
@@ -754,6 +791,34 @@ def pick_sky_alias(materials):
         n += 1
         name = f"cs2porter/brushfix{n}"
     return name
+
+
+NODRAW_MAT = "tools/toolsnodraw"
+
+
+def _sky_brush_nodraw(root):
+    """A brush with a sky face often has toolsnodraw on its other faces. In Source 1 the light
+    that reaches the sky face counts as sky light; in CS2 the sky face lets it through and the
+    nodraw faces behind it cast shadows, so the room under it gets no sun or sky light. Those
+    nodraw faces (never seen) become sky faces too. Returns the number of faces changed."""
+    count = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        for ch in node.children():
+            if ch.name.lower() != "solid":
+                stack.append(ch)
+                continue
+            sides = list(ch.children("side"))
+            mats = [normalize_material(s.get("material", "")) for s in sides]
+            sky = next((m for m in mats if m in SKYBOX_MATS), None)
+            if sky is None:
+                continue
+            for s, m in zip(sides, mats):
+                if m == NODRAW_MAT and s.child("dispinfo") is None:
+                    s.set("material", sky)
+                    count += 1
+    return count
 
 
 def _swap_sky_material(root, alias, mats=SKYBOX_MATS):
@@ -1729,6 +1794,33 @@ def _fmt(v):
     return str(int(v)) if v == int(v) else f"{v:g}"
 
 
+def cp_text(text):
+    """Data control point value with its numbers rounded (230 / 255 = 0.901961 -> 0.9): two
+    decimals, three below 0.1 so small values do not become 0."""
+    out = []
+    for s in str(text).split():
+        try:
+            v = float(s)
+        except ValueError:
+            out.append(s)
+            continue
+        v = round(v, 2 if abs(v) >= 0.1 else 3)
+        out.append(str(int(v)) if v == int(v) else f"{v:g}")
+    return " ".join(out)
+
+
+def color_text(text, default="255 255 255"):
+    """Tint control point color: red green blue, each 0..255. Source 1 colors can carry a
+    fourth number (env_lightglow '255 255 255 400') that CS2 takes as an invalid alpha."""
+    vals = []
+    for s in str(text or "").split()[:3]:
+        try:
+            vals.append(min(max(int(round(float(s))), 0), 255))
+        except ValueError:
+            return default
+    return " ".join(str(v) for v in vals) if len(vals) == 3 else default
+
+
 def _box_piece(solid, mins, size, lo, hi, max_id):
     """Copy of the box brush solid scaled to the box lo..hi (keeps every plane's winding).
     New ids above max_id; max_id None keeps the ids (the copy replaces the solid)."""
@@ -1911,7 +2003,11 @@ EFFECT_VPCFS = {"steam": STEAM_VPCF, "dustmotes": DUSTMOTES_VPCF, "spotlight": L
 GENERATED_VPCF_DIR = "particles/cs2porter"
 BOX_DRAW_DISTANCE = 5000
 EFFECT_CLASSES = ("env_steam", "func_dustmotes", "point_spotlight", "beam_spotlight", "env_spritetrail", "func_dustcloud",
-                  "env_embers", "func_smokevolume", "env_smoketrail", "env_fire")
+                  "env_embers", "func_smokevolume", "env_smoketrail", "env_fire", "env_spark", "env_smokestack",
+                  "point_tesla")
+# env_spark spawnflags
+SPARK_START_ON = 64
+SPARK_DIRECTIONAL = 512
 # env_fire spawnflags
 FIRE_SMOKELESS = 2
 FIRE_START_ON = 4
@@ -1922,6 +2018,9 @@ EFFECT_INPUTS = {
     "dustcloud": {"turnon": "Start", "turnoff": "Stop"},
     "spotlight": {"lighton": "Start", "lightoff": "DestroyImmediately"},
     "fire": {"startfire": "Start", "extinguish": "Stop", "extinguishtemporary": "Stop"},
+    "spark": {"startspark": "Start", "stopspark": "DestroyImmediately"},
+    "smokestack": {"turnon": "Start", "turnoff": "Stop"},
+    "tesla": {"turnon": "Start", "turnoff": "DestroyImmediately"},
 }
 _EFFECT_KEEP = ("id", "classname", "targetname", "parentname", "origin", "angles")
 # a heat wave env_steam only bends the view behind it: it becomes a faint haze
@@ -2111,6 +2210,33 @@ LIGHT_RAY_MIN = 0.35
 LIGHT_RAY_NEAR = 64.0           # a light this close belongs to the spotlight
 
 
+CONE_RAYS = 8
+
+
+def _cone_trace(tracer, origin, fwd, length, radius):
+    """Distance along fwd to the first brush in a cone that is radius wide at length (the
+    Source 1 spotlight beam widens to SpotlightWidth): the middle line alone goes through a
+    small hole the beam itself does not fit, and the beam then went on into the floor."""
+    best = tracer.trace(origin, fwd, length)
+    if radius <= 0:
+        return best
+    # two directions across the beam
+    side = (0.0, 0.0, 1.0) if abs(fwd[2]) < 0.9 else (1.0, 0.0, 0.0)
+    a = (fwd[1] * side[2] - fwd[2] * side[1], fwd[2] * side[0] - fwd[0] * side[2], fwd[0] * side[1] - fwd[1] * side[0])
+    la = math.sqrt(sum(x * x for x in a)) or 1.0
+    a = tuple(x / la for x in a)
+    b = (fwd[1] * a[2] - fwd[2] * a[1], fwd[2] * a[0] - fwd[0] * a[2], fwd[0] * a[1] - fwd[1] * a[0])
+    for i in range(CONE_RAYS):
+        ang = 2.0 * math.pi * i / CONE_RAYS
+        d = tuple(fwd[k] * length + (a[k] * math.cos(ang) + b[k] * math.sin(ang)) * radius for k in range(3))
+        ln = math.sqrt(sum(x * x for x in d))
+        d = tuple(x / ln for x in d)
+        hit = tracer.trace(origin, d, ln)
+        # the distance along the beam's own direction
+        best = min(best, hit * length / ln)
+    return best
+
+
 def _light_positions(root):
     out = []
     for e in root.children("entity"):
@@ -2242,6 +2368,94 @@ def _smokevolume_params(ent, num, size):
             "dir_min": (0.0, 0.0, 0.0), "dir_max": (0.0, 0.0, 0.0), "drag": 0.0}
 
 
+def _spark_params(ent, num):
+    """env_spark (Source 1 CEnvSpark / FX_ElectricSpark): a burst of sparks every 0.1 +
+    random(0, MaxDelay) seconds, flying every way, or along the entity's angles when Directional.
+    Magnitude and TrailLength go to data control point 1 (the particle maps them like CS2's own
+    particles/ambient_fx/env_sparks_e.vpcf)."""
+    delay = min(max(num("MaxDelay", 0.0), 0.0), 60.0)
+    if _spawnflags(ent) & SPARK_DIRECTIONAL:
+        move = {"speed_min": 0.0, "speed_max": 40.0, "local_min": (150.0, -60.0, -60.0),
+                "local_max": (350.0, 60.0, 60.0), "noise": 40.0}
+    else:
+        move = {"speed_min": 100.0, "speed_max": 200.0, "local_min": (-200.0, -200.0, -200.0),
+                "local_max": (200.0, 200.0, 200.0), "noise": 100.0}
+    return dict(move, _template="spark", dur_min=0.1, dur_max=round(0.1 + delay, 2))
+
+
+def _local_vector(vec, angles):
+    """World vector vec in the frame of an entity turned by angles (pitch, yaw, roll)."""
+    p, y, r = (math.radians(a) for a in (angles or (0.0, 0.0, 0.0))[:3])
+    sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(r), math.cos(r)
+    fwd = (cp * cy, cp * sy, -sp)
+    left = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp)
+    up = (cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp)
+    return tuple(sum(vec[k] * axis[k] for k in range(3)) for axis in (fwd, left, up))
+
+
+def _smokestack_params(ent, num):
+    """env_smokestack (Source 1 C_SmokeStack): 'Rate' particles a second from a disc of
+    BaseSpread radius, rising at Speed (plus up to SpreadSpeed sideways and the wind) for
+    JetLength units, growing from StartSize to EndSize, drawn with SmokeMaterial in rendercolor
+    at renderamt and turning at up to 'roll' degrees a second."""
+    speed = max(num("Speed", 30.0), 0.1)
+    side = max(num("SpreadSpeed", 15.0), 0.0)
+    start = max(num("StartSize", 20.0), 0.5)
+    wind_speed = num("WindSpeed", 0.0)
+    wind_yaw = math.radians(num("WindAngle", 0.0))
+    wind = _local_vector((math.cos(wind_yaw) * wind_speed, math.sin(wind_yaw) * wind_speed, 0.0),
+                         _vec(ent.get("angles")))
+    life = min(max(num("JetLength", 180.0), 1.0) / speed, 30.0)
+    rate = max(num("Rate", 20.0), 0.1)
+    return {"_template": "smokestack",
+            "_material": normalize_material(ent.get("SmokeMaterial") or "particle/SmokeStack"),
+            "rate": rate, "life": life, "radius": start,
+            "end_scale": max(num("EndSize", 30.0), 0.0) / start,
+            "spread": max(num("BaseSpread", 20.0), 0.0),
+            "vel_min": (wind[0] - side, wind[1] - side, speed + wind[2]),
+            "vel_max": (wind[0] + side, wind[1] + side, speed + wind[2]),
+            "color": _rgb(ent.get("rendercolor"), (255, 255, 255)),
+            "alpha": min(max(num("renderamt", 255.0) / 255.0, 0.0), 1.0),
+            "roll": max(abs(num("roll", 0.0)), 0.0),
+            "max_particles": min(int(rate * life * 1.25) + 16, 5000)}
+
+
+# point_tesla looks this many ways for the surfaces its arcs end on
+TESLA_RAYS = 96
+
+
+def _tesla_params(ent, num, origin, tracer):
+    """point_tesla (Source 1 CTesla): every interval_min..interval_max seconds while on, it
+    shoots beamcount_min..max arcs (thick_min..max wide, living lifetime_min..max seconds, in
+    m_Color with 'texture') from its place to surfaces up to m_flRadius away. The particle's arcs
+    all have the typical length of those rays (the median hit distance)."""
+    radius = max(num("m_flRadius", 200.0), 8.0)
+    length = radius * 0.6
+    if tracer is not None and origin is not None:
+        rnd = random.Random(1)
+        hits = []
+        for _ in range(TESLA_RAYS):
+            z = rnd.uniform(-1.0, 1.0)
+            a = rnd.uniform(0.0, 2.0 * math.pi)
+            s = math.sqrt(1.0 - z * z)
+            d = tracer.trace(origin, (s * math.cos(a), s * math.sin(a), z), radius)
+            if d < radius:
+                hits.append(d)
+        if hits:
+            hits.sort()
+            length = max(hits[len(hits) // 2], 8.0)
+    lo, hi = sorted((max(num("beamcount_min", 6.0), 1.0), max(num("beamcount_max", 8.0), 1.0)))
+    t0, t1 = sorted((max(num("interval_min", 0.5), 0.05), max(num("interval_max", 2.0), 0.05)))
+    l0, l1 = sorted((max(num("lifetime_min", 0.3), 0.02), max(num("lifetime_max", 0.3), 0.02)))
+    w0, w1 = sorted((max(num("thick_min", 5.0), 0.5), max(num("thick_max", 6.0), 0.5)))
+    return {"_template": "tesla",
+            "_material": normalize_material(ent.get("texture") or "sprites/physbeam"),
+            "count_min": round(lo), "count_max": round(hi), "dur_min": t0, "dur_max": t1,
+            "life_min": l0, "life_max": l1, "width_min": w0 / 2.0, "width_max": w1 / 2.0,
+            "length": round(length), "color": _rgb(ent.get("m_Color"), (255, 255, 255)),
+            "max_particles": int(hi * max(l1 / t0, 1.0)) + 8}
+
+
 def _generated_vpcf(effects, kind, params):
     """Path of the particle file for these values; effects["generated"] collects them for the
     pipeline, which writes the files."""
@@ -2322,7 +2536,7 @@ def _effect_props(ent, cls, tracer=None, lights=None):
         origin = _vec(ent.get("origin"))
         if tracer is not None and origin is not None:
             # the Source 1 beam ends where it hits a brush, SpotlightLength is its longest
-            length = max(tracer.trace(origin, fwd, length), 1.0)
+            length = max(_cone_trace(tracer, origin, fwd, length, num("SpotlightWidth", 50.0) / 2.0), 1.0)
         # the particle beam looks longer than the Source 1 one, and a dim light gets a short beam
         length = max(length * LIGHT_RAY_SCALE * _beam_brightness(ent, origin, lights), 1.0)
         flags = _spawnflags(ent)
@@ -2345,6 +2559,21 @@ def _effect_props(ent, cls, tracer=None, lights=None):
             "start_active": "1" if flags & FIRE_START_ON else "0",
             "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255",
             "_effect": f"particles/burning_fx/env_fire_{name}{smoke}.vpcf"}
+    if cls == "env_spark":
+        # data control point 1 = Magnitude, TrailLength (what the Source 1 entity has)
+        return "spark", _vec(ent.get("origin")), {
+            "start_active": "1" if _spawnflags(ent) & SPARK_START_ON else "0",
+            "data_cp_value": f"{_fmt(max(num('Magnitude', 1.0), 1.0))} {_fmt(max(num('TrailLength', 1.0), 1.0))} 0",
+            "tint_cp_color": "255 255 255", "_params": _spark_params(ent, num)}
+    if cls == "env_smokestack":
+        return "smokestack", _vec(ent.get("origin")), {
+            "start_active": "1" if (ent.get("InitialState") or "0").strip() == "1" else "0",
+            "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255", "_params": _smokestack_params(ent, num)}
+    if cls == "point_tesla":
+        origin = _vec(ent.get("origin"))
+        return "tesla", origin, {
+            "start_active": "0", "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255",
+            "_params": _tesla_params(ent, num, origin, tracer)}
     if cls == "env_spritetrail":
         # data control point 1 = lifetime, start width, end width; the particles stay where
         # they were made while the entity (and its parent) moves on, which draws the trail
@@ -2371,7 +2600,7 @@ def _effects_to_particles(root, effects):
         cls = ent.classname
         if cls not in EFFECT_CLASSES:
             continue
-        if cls in ("point_spotlight", "beam_spotlight") and tracer is None:
+        if cls in ("point_spotlight", "beam_spotlight", "point_tesla") and tracer is None:
             tracer = BrushTracer(root)
             lights = _light_positions(root)
         made = _effect_props(ent, cls, tracer, lights)
@@ -2382,7 +2611,8 @@ def _effects_to_particles(root, effects):
         effect = props.pop("_effect", None) or \
             (_generated_vpcf(effects, kind, params) if params else EFFECT_VPCFS[kind])
         props = dict(props, classname="info_particle_system", effect_name=effect,
-                     data_cp="1", tint_cp="2")
+                     data_cp="1", tint_cp="2", data_cp_value=cp_text(props.get("data_cp_value", "0 0 0")),
+                     tint_cp_color=color_text(props.get("tint_cp_color")))
         ent.items = [i for i in ent.items if isinstance(i, list) and i[0].lower() in _EFFECT_KEEP
                      or isinstance(i, VNode) and i.name.lower() == "connections"]
         ent.set("origin", " ".join(_fmt(c) for c in origin))
@@ -2419,11 +2649,12 @@ def _sprite_alpha(ent):
 
 
 def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key=None,
-                split_triggers=False, effects=None, log=None, bhop_blocks=False, world=None):
+                split_triggers=False, effects=None, log=None, bhop_blocks=False, world=None, strip_key=None):
     """Applies the VMF fixes made before the import. Returns a summary of the changes.
     attributes: dict that receives the attribute names of the converted name / class filters.
     meshes: dict that receives the func_brush entities to turn into meshes (see vmap).
     teleport_key: when set, trigger_teleports with a landmark use the bhop script.
+    strip_key: when set, player_weaponstrip is removed and its Strip inputs use the bhop script.
     split_triggers: very wide and thin trigger boxes are split into pieces.
     effects: dict that receives the particle entities made from env_steam etc.
     bhop_blocks: Source 1 bhop blocks become bhop script blocks (needs teleport_key).
@@ -2442,6 +2673,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["spawns"] = _fill_spawns(root)
     stats["nonsolid"] = _nonsolid_disps(root)
     if sky_alias:
+        stats["sky_nodraw"] = _sky_brush_nodraw(root)
         stats["skybox"] = _swap_sky_material(root, sky_alias)
     stats["ladders"] = _ladders_to_world(root)
     stats["trigger_clip"] = _world_triggers_to_clip(root)
@@ -2456,6 +2688,8 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
         stats["split"] += odd
     if teleport_key:
         stats["teleports"] = _teleports_to_bhop(root, teleport_key)
+    if strip_key:
+        stats["weaponstrip"] = _weaponstrips_to_bhop(root, strip_key)
     stats["meshes"] = _brushes_to_meshes(root, meshes if meshes is not None else {})
     stats["targetnames"] = _fix_special_targetnames(root)
 
@@ -2521,7 +2755,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks"):
+                  "landmarks", "weaponstrip", "sky_nodraw"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

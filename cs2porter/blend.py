@@ -312,21 +312,30 @@ def only_blends(disps, sources):
 # .vmap side
 # ---------------------------------------------------------------------------
 
-_TOKEN_RE = re.compile(r'"(?:[^"\\]|\\.)*"|[{}\[\]]')
 _MESH_RE = re.compile(r'"CMapMesh"\s*\r?\n[ \t]*\{')
 
 
+# the next bracket outside of strings: the strings and text before it are skipped inside the
+# regex engine (a .vmap is mostly long arrays of strings, few brackets)
+_BRACKET_RE = re.compile(r'(?:[^"{}\[\]]++|"(?:[^"\\]|\\.)*+")*+([{}\[\]])')
+
+
 def _close(text, open_pos):
+    """Index just after the bracket/brace that closes the one at open_pos."""
     depth = 0
-    for m in _TOKEN_RE.finditer(text, open_pos):
-        tok = m.group(0)
-        if tok in "{[":
+    pos = open_pos
+    search = _BRACKET_RE.search
+    while True:
+        m = search(text, pos)
+        if not m:
+            raise ValueError("unbalanced brackets")
+        pos = m.end()
+        if m.group(1) in "{[":
             depth += 1
-        elif tok in "}]":
+        else:
             depth -= 1
             if depth == 0:
-                return m.end()
-    raise ValueError("unbalanced brackets")
+                return pos
 
 
 def _array(text, name, start=0, end=None):

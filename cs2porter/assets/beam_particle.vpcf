@@ -29,7 +29,7 @@
 				{
 					m_iControlPoint = 3
 					m_iAttachType = "PATTACH_WORLDORIGIN"
-					m_vecOffset = [ 1.0, 1.0, 0.0 ]
+					m_vecOffset = [ 1.0, 1.0, 350.0 ]
 					m_entityName = "self"
 				},
 			]
@@ -115,7 +115,14 @@
 			m_flTextureVWorldSize =
 			{
 				m_nType = "PF_TYPE_LITERAL"
-				m_flLiteralValue = 1000.0
+				m_flLiteralValue = 100.0
+			}
+			m_flTextureVScrollRate =
+			{
+				m_nType = "PF_TYPE_CONTROL_POINT_COMPONENT"
+				m_nMapType = "PF_MAP_TYPE_DIRECT"
+				m_nControlPoint = 3
+				m_nVectorComponent = 2
 			}
 			m_flAddSelfAmount =
 			{

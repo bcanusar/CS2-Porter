@@ -18,11 +18,13 @@ import re
 import uuid
 
 from .materials import BROKEN_CABLE_MATERIALS, CABLE_FALLBACK, out_name
+from .vmf import color_text, cp_text
 from .vmap import (_PROPS_RE, _apply_props, _children_span, _close, _entity_props, _num, _pos_key,
                    _split_elements, edit_entities, element_block, is_null_element, transform_world)
 
 GLOW_VPCF = "particles/glow_particle.vpcf"
 BEAM_VPCF = "particles/beam_particle.vpcf"
+BEAM_SCROLL_UNITS = 10.0
 
 PHYSBOX_FLAGS = 32768 | 1048576         # Motion Disabled, Start Asleep
 PHYSBOX_PROPS = {"classname": "func_physbox", "spawnflags": str(PHYSBOX_FLAGS),
@@ -121,12 +123,19 @@ def _sprite_material(name):
     return n[:-4] if n.endswith((".vmt", ".spr")) else n
 
 
-def convert_glows(text, stats, sprite_textures=None, glow_particles=None):
+GLOW_INPUTS = {"showsprite": "Start", "hidesprite": "DestroyImmediately", "stop": "DestroyImmediately"}
+BEAM_INPUTS = {"turnon": "Start", "turnoff": "DestroyImmediately"}
+
+
+def convert_glows(text, stats, sprite_textures=None, glow_particles=None, renames=None):
     """sprite_textures: {sprite material: texture}; glow_particles receives {vpcf: texture} for
-    the glows that got a particle drawing with their own sprite texture."""
+    the glows that got a particle drawing with their own sprite texture; renames receives
+    (names, input mapping) for the inputs sent to them from the map's other files."""
     if '"env_particle_glow"' not in text:
         return text
     names = set()
+    if renames is not None:
+        renames.append((names, GLOW_INPUTS))
 
     def fn(p, _origin):
         if p.get("classname") != "env_particle_glow":
@@ -145,15 +154,14 @@ def convert_glows(text, stats, sprite_textures=None, glow_particles=None):
                 glow_particles[effect] = sprite_textures[mat]
         return {"classname": "info_particle_system", "effect_name": effect,
                 "start_active": p.get("start_active") or "1",
-                "data_cp": "1", "data_cp_value": f"{_num(alpha)} {_num(scale)} {_num(illum)}",
-                "tint_cp": "2", "tint_cp_color": p.get("colortint") or "255 255 255",
+                "data_cp": "1", "data_cp_value": cp_text(f"{_num(alpha)} {_num(scale)} {_num(illum)}"),
+                "tint_cp": "2", "tint_cp_color": color_text(p.get("colortint")),
                 "scale": None, "colortint": None, "selfillumscale": None, "alphascale": None,
                 "effect_textureoverride": None}
 
     text, _n = edit_entities(text, fn)
     # the glow particle never dies by itself: hiding it means removing it
-    text = rename_inputs(text, names, {"showsprite": "Start", "hidesprite": "DestroyImmediately",
-                                       "stop": "DestroyImmediately"}, stats, ("togglesprite",))
+    text = rename_inputs(text, names, GLOW_INPUTS, stats, ("togglesprite",))
     return text
 
 
@@ -168,8 +176,10 @@ def convert_elements(text, fx, stats):
     if '"env_beam"' in text or '"env_laser"' in text:
         fn, names = _beam_step(stats)
         steps.append(fn)
-        after.append(lambda tx: rename_inputs(tx, names, {"turnon": "Start", "turnoff": "DestroyImmediately"},
-                                              stats, ("toggle",)))
+        after.append(lambda tx: rename_inputs(tx, names, BEAM_INPUTS, stats, ("toggle",)))
+        renames = getattr(fx, "renames", None)
+        if renames is not None:
+            renames.append((names, BEAM_INPUTS))
     if "path_particle_rope" in text:
         steps.append(_rope_step(fx.ropes, stats, fx.cable_missing))
     if '"func_button"' in text and "OnDamaged" in text:
@@ -203,7 +213,7 @@ def convert_elements(text, fx, stats):
 def convert_beams(text, stats):
     fn, names = _beam_step(stats)
     text, _ch = transform_world(text, fn)
-    return rename_inputs(text, names, {"turnon": "Start", "turnoff": "DestroyImmediately"}, stats, ("toggle",))
+    return rename_inputs(text, names, BEAM_INPUTS, stats, ("toggle",))
 
 
 def _beam_step(stats):
@@ -230,10 +240,14 @@ def _beam_step(stats):
             flags = 0
         radius = max(0.25, _float(width, 2.0) / 2.0)
         alpha = min(max(_float(p.get("renderamt"), 255.0) / 255.0, 0.0), 1.0)
+        # Source 1 beams (beamdraw.cpp) repeat their texture every 100 units and scroll it
+        # TextureScroll / 10 times a second: TextureScroll * 10 units a second
+        scroll = round(_float(p.get("texturescroll"), 35.0) * BEAM_SCROLL_UNITS, 2)
         changes = {"classname": "info_particle_system", "effect_name": BEAM_VPCF,
                    "start_active": "1" if flags & 1 else "0",
-                   "cpoint1": end.strip(), "data_cp": "3", "data_cp_value": f"{_num(radius)} {_num(alpha)} 1",
-                   "tint_cp": "2", "tint_cp_color": p.get("rendercolor") or "255 255 255"}
+                   "cpoint1": end.strip(), "data_cp": "3",
+                   "data_cp_value": cp_text(f"{_num(radius)} {_num(alpha)} {_num(scroll)}"),
+                   "tint_cp": "2", "tint_cp_color": color_text(p.get("rendercolor"))}
         if start.strip():
             changes["cpoint0"] = start.strip()
         if p.get("targetname"):
@@ -602,7 +616,7 @@ def set_effects(text, effects, stats):
     """Sets the particle keys again on the info_particle_systems made from env_steam etc.
     (vmf._effects_to_particles) and renames the inputs sent to them."""
     table = (effects or {}).get("props") or {}
-    if not table or '"info_particle_system"' not in text:
+    if not table:
         return text
 
     def fn(p, origin):
@@ -614,7 +628,9 @@ def set_effects(text, effects, stats):
         stats["effects"] += 1
         return dict(table[origin])
 
-    text, _n = edit_entities(text, fn)
+    if '"info_particle_system"' in text:
+        text, _n = edit_entities(text, fn)
+    # the outputs sent to them can be in another file of the map (a prefab) than the particles
     names = effects.get("names") or {}
     from .vmf import EFFECT_INPUTS
     for kind, mapping in EFFECT_INPUTS.items():
@@ -769,6 +785,33 @@ def _water_step(water_vmats, stats, underwater=None):
         return out
 
     return fn
+
+
+# ---------------------------------------------------------------------------
+# see-through meshes are no vis contributors
+# ---------------------------------------------------------------------------
+
+def see_through_meshes(text, sizes, stats):
+    """World meshes whose drawn faces can all be seen through (glass, grates, water ...) get
+    "Not a Vis Contributor": in Source 1 translucent brushes did not block visibility either.
+    Tool faces (nodraw, clip ...) do not count; sizes is the addon's uvfix.TextureSizes."""
+    from .vmap import _set_mesh_attr
+
+    def fn(e):
+        if not e.lstrip().startswith('"CMapMesh"') or '"visexclude" "bool" "0"' not in e:
+            return None
+        m = _MATS_RE.search(e)
+        if not m:
+            return None
+        drawn = [x.lower() for x in re.findall(r'"([^"]*)"', m.group(1))
+                 if not x.lower().startswith("materials/tools/")]
+        if not drawn or not all(sizes.see_through(x) for x in drawn):
+            return None
+        stats["see_through"] = stats.get("see_through", 0) + 1
+        return [_set_mesh_attr(e, "visexclude", "bool", "1")]
+
+    text, _ch = transform_world(text, fn)
+    return text
 
 
 # ---------------------------------------------------------------------------

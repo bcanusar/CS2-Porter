@@ -278,10 +278,12 @@ class AssetSources:
                     src = DirSource(p, t("src_game_dir", game=game, name=os.path.basename(p)))
                     src.game = game
                     self.sources.append(src)
+        # loose_dirs: folders or (folder, label) whose files also count by their name
         for d in loose_dirs:
+            d, label = d if isinstance(d, tuple) else (d, None)
             if d and os.path.isdir(d):
-                self.sources.append(LooseSource(d, t("src_extra", name=os.path.basename(os.path.normpath(d))),
-                                                role="loose"))
+                self.sources.append(LooseSource(
+                    d, label or t("src_extra", name=os.path.basename(os.path.normpath(d))), role="loose"))
         # last: the full copies vbsp made of materials the map did not pack (bsp.COPIES_DIR)
         copies = os.path.join(embedded_dir, COPIES_DIR) if embedded_dir else None
         if copies and os.path.isdir(copies):
@@ -361,6 +363,9 @@ class CS2Index:
         self.content_dir = content_dir
         self.game_dir = game_dir
         self.paths = set()
+        self._vpks = []
+        self._arcs = {}             # opened when a material's shader is looked at
+        self._broken = {}
         if cs2_dir:
             for rel in ("game/csgo/pak01_dir.vpk", "game/core/pak01_dir.vpk"):
                 p = os.path.join(cs2_dir, *rel.split("/"))
@@ -369,12 +374,47 @@ class CS2Index:
                         arc = VPKArchive(p)
                         self.paths.update(arc.entries.keys())
                         arc.close()
+                        self._vpks.append(p)
                     except (OSError, VPKError) as e:
                         if log:
                             log(t("src_cs2_vpk_fail", p=p, e=e), "warn")
 
     def in_cs2(self, rel_c):
         return _norm(rel_c) in self.paths
+
+    # CS2 materials with these shaders draw wrong: the error shader (a Source 1 name CS2 kept
+    # without a working material, e.g. effects/blueblacklargebeam, sprites/glow01) and the
+    # modulate decals (decals/bloodstain_003b); the Source 1 material is converted instead
+    BROKEN_SHADERS = ("error.vfx", "csgo_decalmodulate.vfx")
+
+    def broken_in_cs2(self, rel_c):
+        """Is CS2's own compiled material rel_c ('materials/x.vmat_c') one that draws wrong?"""
+        rel_c = _norm(rel_c)
+        if rel_c in self._broken:
+            return self._broken[rel_c]
+        bad = False
+        if rel_c.endswith(".vmat_c") and rel_c in self.paths:
+            from .cs2res import material_shader, texture_refs
+            for p in self._vpks:
+                try:
+                    arc = self._arcs.get(p)
+                    if arc is None:
+                        arc = self._arcs[p] = VPKArchive(p)
+                    if rel_c in arc.entries:
+                        data = arc.read(rel_c)
+                        # a texture CS2 does not have draws as the missing texture checkers
+                        # (effects/offgaragedr names metal/offgaragedr_color)
+                        bad = (material_shader(data) in self.BROKEN_SHADERS
+                               or any(_norm(t + "_c") not in self.paths for t in texture_refs(data)))
+                        break
+                except (OSError, VPKError):
+                    continue
+        self._broken[rel_c] = bad
+        return bad
+
+    def in_cs2_working(self, rel_c):
+        """In CS2 and not one of its materials that draw wrong."""
+        return self.in_cs2(rel_c) and not self.broken_in_cs2(rel_c)
 
     def in_addon(self, rel_src):
         rel_src = _norm(rel_src)
