@@ -1,5 +1,6 @@
 """Settings: load / save and automatic folder detection."""
 
+import copy
 import json
 import os
 import re
@@ -68,6 +69,9 @@ DEFAULTS = {
     "last_tool_dir": "",
     "last_export_dir": "",
     "tool_paths": {},
+    "sky_mode": "faces",        # Skybox Builder: "faces" (Source 1 faces) or "cube" (own images)
+    "sky_cube": {},             # Skybox Builder open cube: face -> image path
+    "sky_cube_name": "skybox",
     # folders with Source 1 files (materials/, models/ ...) searched before the installed games
     "resource_dirs": [],
     # an update the user chose to skip (its tag)
@@ -98,8 +102,10 @@ DEFAULTS = {
         # brush textures that vanish with distance by their own mips get faces that fade out
         "mip_fade": True,
     },
-    # the map list of the Port Map tab: [[map path, addon name], ...]
 }
+
+# the only keys kept between starts (the settings); everything else starts from DEFAULTS
+SAVED = ("lang", "theme", "maximized", "cs2_dir", "resource_dirs", "skip_update", "bhop_blocks_user", "opts")
 
 # folders below a resource folder that hold game files
 RESOURCE_SUBDIRS = ("materials", "models", "sound", "scripts")
@@ -192,16 +198,16 @@ def load():
                 data = json.load(f)
         except (OSError, ValueError):
             data = {}
-    data = {k: v for k, v in data.items() if k in DEFAULTS}
+    data = {k: v for k, v in data.items() if k in SAVED}
     if isinstance(data.get("opts"), dict):
         data["opts"] = {k: v for k, v in data["opts"].items() if k in DEFAULTS["opts"]}
-    cfg = _merge(DEFAULTS, data)
+    cfg = _merge(copy.deepcopy(DEFAULTS), data)
     autodetect(cfg, only_missing=True)
     return cfg
 
 
 def save(cfg):
-    data = {k: cfg.get(k, v) for k, v in DEFAULTS.items()}
+    data = {k: cfg.get(k, DEFAULTS[k]) for k in SAVED}
     tmp = SETTINGS_FILE + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:

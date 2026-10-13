@@ -94,6 +94,9 @@ class BspTracer:
         self.brush_boxes = [(struct.unpack_from("<3h", leafs, o + 8), struct.unpack_from("<3h", leafs, o + 14))
                             for s, v, o in zip(self.solid, self.void, range(0, len(leafs) - size + 1, size))
                             if s and not v]
+        # the open space inside the sealed map (where players can be)
+        self.air_boxes = [(struct.unpack_from("<3h", leafs, o + 8), struct.unpack_from("<3h", leafs, o + 14))
+                          for s, o in zip(self.solid, range(0, len(leafs) - size + 1, size)) if not s]
         models = info.read_lump(LUMP_MODELS)
         self.head = struct.unpack_from("<i", models, 36)[0] if len(models) >= 48 else 0
         # the tree only describes the space inside the world's bounds

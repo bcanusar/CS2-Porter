@@ -287,7 +287,13 @@ def analyze(root):
                 info.add_material(val, "decal")
                 continue
             if cls in BEAM_CLASSES and k == "texture":
-                continue        # beams become particles (vmap.convert_beams)
+                # beams become particles (vmap.convert_beams) that draw the beam's texture
+                info.add_material(val[:-4] if vl.endswith(".spr") else val, "sprite")
+                continue
+            if cls == "func_smokevolume" and k == "material":
+                # the smoke particle draws the volume's own puff texture
+                info.add_material(val, "sprite")
+                continue
             if k in _MATERIAL_KEYS:
                 usage = _MATERIAL_KEYS[k]
                 if usage is None:
@@ -1260,10 +1266,11 @@ SPLIT_MIN_PIECE = 512
 SPLIT_MAX_PIECE = 1024
 SPLIT_LARGE_PIECE = 10000
 
-# boost trigger_multiples (basevelocity outputs) at most BOOST_MAX_RAISE high get
-# BOOST_HEIGHT; only the top face moves up
+# boost and gravity trigger_multiples (basevelocity / gravity outputs) at most
+# BOOST_MAX_RAISE high get BOOST_HEIGHT; only the top face moves up
 BOOST_MAX_RAISE = 4
 BOOST_HEIGHT = 6
+_BOOST_PARAM_RE = re.compile(r"\b(?:basevelocity|gravity)\b", re.I)
 
 
 def split_piece_size(height):
@@ -1336,13 +1343,13 @@ def _max_solid_id(root):
 
 
 def _raise_boost_triggers(root):
-    """Boost trigger_multiples (an AddOutput basevelocity output) that are at most
-    BOOST_MAX_RAISE high get BOOST_HEIGHT; the bottom stays where it is."""
+    """Boost and gravity trigger_multiples (an AddOutput basevelocity / gravity output) that
+    are at most BOOST_MAX_RAISE high get BOOST_HEIGHT; the bottom stays where it is."""
     count = 0
     for ent in root.children("entity"):
         if ent.classname != "trigger_multiple":
             continue
-        if not any(o[2].strip().lower() == "addoutput" and "basevelocity" in o[3].lower()
+        if not any(o[2].strip().lower() == "addoutput" and _BOOST_PARAM_RE.search(o[3])
                    for o in _outputs(ent) if len(o) >= 4):
             continue
         for k, item in enumerate(ent.items):
@@ -1783,6 +1790,93 @@ def fade_faces(root, fades, meshes):
     return faces_done, len(cells)
 
 
+# how far a face may stick out of the face it lies on and still count as lying fully on it, and
+# how far apart the two planes may be (a decompiled map is off by a few hundredths here and there)
+TOUCH_EPS = 0.5
+TOUCH_GAP = 0.2
+
+
+def _plane_key(n, d):
+    return (round(n[0], 2), round(n[1], 2), round(n[2], 2), math.floor(d))
+
+
+def _covers(outer, inner, n):
+    """True when the convex polygon inner lies fully inside the convex polygon outer (both on
+    the plane with normal n)."""
+    axis = max(range(3), key=lambda k: abs(n[k]))
+    u, v = [k for k in range(3) if k != axis]
+    q = [(p[u], p[v]) for p in outer]
+    area = sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(q, q[1:] + q[:1]))
+    if abs(area) < 1e-6:
+        return False
+    sign = 1.0 if area > 0 else -1.0
+    for a, b in zip(q, q[1:] + q[:1]):
+        ex, ey = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(ex, ey)
+        if length < 1e-6:
+            continue
+        for p in inner:
+            # distance of the point from the edge, positive inside
+            if sign * (ex * (p[v] - a[1]) - ey * (p[u] - a[0])) / length < -TOUCH_EPS:
+                return False
+    return True
+
+
+def hide_touching_faces(root, mats):
+    """Faces of see-through brushes (mats: the materials that blend with what is behind them)
+    that lie fully on a face of another see-through brush, the two facing each other. Source 1
+    drew such a place once; CS2 draws both faces and it looks twice as bright. They become
+    nodraw. A face that only partly lies on the other one stays, so no hole can open. Only
+    brushes that stay together: the world with the brush entities that never change, or the
+    brushes of one other entity. Returns the number of faces."""
+    from .blend import _outward_planes
+    refs = _referenced_names(root)
+    static, groups = [], []
+    world = root.child("world")
+    if world is not None:
+        static.append(world)
+    for e in root.children("entity"):
+        if not e.children("solid"):
+            continue
+        if e.classname in _STATIC_BRUSHES and not _outputs(e) and not _is_referenced(e.get("targetname") or "", refs):
+            static.append(e)
+        else:
+            groups.append([e])
+    groups.insert(0, static)
+    hidden = 0
+    for holders in groups:
+        table = {}
+        faces = []
+        for holder in holders:
+            for solid in holder.children("solid"):
+                sides = solid.children("side")
+                if not any(normalize_material(s.get("material", "")) in mats for s in sides) \
+                        or any(s.child("dispinfo") is not None for s in sides):
+                    continue
+                planes = _outward_planes(sides)
+                if not planes:
+                    continue
+                planes = [(tuple(p[0]), p[1]) for p in planes]
+                for pl, side, poly in zip(*_brush_faces(planes, sides)):
+                    if side is None or normalize_material(side.get("material", "")) not in mats:
+                        continue
+                    face = (pl[0], pl[1], poly, side, solid)
+                    faces.append(face)
+                    table.setdefault(_plane_key(pl[0], pl[1]), []).append(face)
+        done = []
+        for n, d, poly, side, solid in faces:
+            back = (-n[0], -n[1], -n[2])
+            others = [o for dd in (-d - TOUCH_GAP, -d + TOUCH_GAP) for o in table.get(_plane_key(back, dd), ())]
+            if any(o[4] is not solid and abs(o[1] + d) <= TOUCH_GAP and sum(a * b for a, b in zip(o[0], n)) < -0.9999
+                   and _covers(o[2], poly, n) for o in others):
+                done.append(side)
+        # set after the search, so two equal faces both go
+        for side in done:
+            side.set("material", NODRAW)
+        hidden += len(done)
+    return hidden
+
+
 def _walk(node):
     for ch in node.children():
         yield ch
@@ -2139,6 +2233,16 @@ class BrushTracer:
                     best = hit
         return best
 
+    def inside(self, point):
+        """True when the point is inside one of the brushes."""
+        for mins, maxs, solid, pts in self.solids:
+            if any(point[k] < mins[k] or point[k] > maxs[k] for k in range(3)):
+                continue
+            if all(n[0] * point[0] + n[1] * point[1] + n[2] * point[2] - d <= 0
+                   for n, d in self._brush_planes(solid, pts)):
+                return True
+        return False
+
 
 # an infodecal sticks to a face this far from it at most (in front of it, or a little behind)
 DECAL_REACH = 16.0
@@ -2348,20 +2452,50 @@ def _smoketrail_params(ent, num):
             "spawn_radius": max(num("spawnradius", 15.0), 0.0), "drag": 0.0}
 
 
-def _smokevolume_params(ent, num, size):
+# Source 1 func_smokevolume fades each puff near the world: rays this long along the six axes
+SMOKE_WALL_REACH = 100.0
+SMOKE_FADE_SAMPLES = 200
+_AXES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+
+
+def _smoke_wall_fade(tracer, mins, counts, spacing, radius):
+    """Mean alpha of the puffs after Source 1's wall fade (C_FuncSmokeVolume::FillVolume): a
+    puff inside a brush is not drawn; for each world surface a ray along an axis reaches within
+    SMOKE_WALL_REACH, a puff closer to it than its radius gets (distance / radius)^3 of its
+    alpha. The puffs sit on a grid ParticleSpacingDistance apart, half of that in from mins."""
+    points = [tuple(mins[k] + (i, j, m)[k] * spacing + spacing / 2 for k in range(3))
+              for i in range(counts[0]) for j in range(counts[1]) for m in range(counts[2])]
+    if len(points) > SMOKE_FADE_SAMPLES:
+        points = points[::len(points) // SMOKE_FADE_SAMPLES + 1]
+    total = 0.0
+    for p in points:
+        if tracer.inside(p):
+            continue
+        a = 1.0
+        for d in _AXES:
+            dist = tracer.trace(p, d, SMOKE_WALL_REACH)
+            if dist < SMOKE_WALL_REACH and dist < radius:
+                a *= (dist / radius) ** 3
+        total += a
+    return total / len(points) if points else 1.0
+
+
+def _smokevolume_params(ent, num, size, mins=None, tracer=None):
     """func_smokevolume (Source 1 C_FuncSmokeVolume): the box is filled with smoke puffs every
-    ParticleSpacingDistance units, ParticleDrawWidth wide, colored between Color1 and Color2,
-    as thick as Density and turning at RotationSpeed. They stay for good."""
+    ParticleSpacingDistance units, ParticleDrawWidth wide, drawn with the entity's material,
+    colored between Color1 and Color2, as thick as Density (less near walls, _smoke_wall_fade)
+    and turning at RotationSpeed. They stay for good."""
     spacing = max(num("ParticleSpacingDistance", 80.0), 8.0)
-    count = 1
-    for k in range(3):
-        count *= max(1, round(size[k] / spacing))
+    counts = [max(1, round(size[k] / spacing)) for k in range(3)]
+    count = counts[0] * counts[1] * counts[2]
     radius = max(num("ParticleDrawWidth", 120.0), 1.0) / 2.0
     c1 = _rgb(ent.get("Color1"), (255, 255, 255))
     c2 = _rgb(ent.get("Color2"), (255, 255, 255))
+    fade = _smoke_wall_fade(tracer, mins, counts, spacing, radius) if tracer is not None and mins else 1.0
     return {"_template": "smoke", "count": min(count, 2000), "life_min": 3600.0, "life_max": 3600.0,
+            "_material": normalize_material(ent.get("material") or "particle/particle_smokegrenade"),
             "radius_min": radius * 0.9, "radius_max": radius * 1.1, "end_scale": 1.0,
-            "alpha": min(max(num("Density", 1.0), 0.0), 1.0) * 0.7,
+            "alpha": round(min(max(num("Density", 1.0), 0.0), 1.0) * fade, 3),
             "color_min": tuple(min(a, b) for a, b in zip(c1, c2)),
             "color_max": tuple(max(a, b) for a, b in zip(c1, c2)), "color_end": None,
             "spin": max(abs(num("RotationSpeed", 10.0)), 0.0), "speed_min": 0.0, "speed_max": 0.0,
@@ -2418,6 +2552,70 @@ def _smokestack_params(ent, num):
             "alpha": min(max(num("renderamt", 255.0) / 255.0, 0.0), 1.0),
             "roll": max(abs(num("roll", 0.0)), 0.0),
             "max_particles": min(int(rate * life * 1.25) + 16, 5000)}
+
+
+# env_beam / env_laser spawnflags
+BEAM_START_ON = 1
+BEAM_SPARK_START = 16
+BEAM_SPARK_END = 32
+SPARK_SILENT = 256
+
+
+def _beam_sparks(root):
+    """Source 1 beams with the Start / End Sparks flags (beam_shared.cpp DoSparks) make sparks at
+    their ends every 0.1 seconds while they are on, the same sparks as an env_spark with no delay.
+    Each such end gets an env_spark (the beam's name, so its outputs turn both on and off; it
+    becomes a spark particle like the other env_sparks). env_laser stops at the first brush on its
+    way (CEnvLaser::StrikeThink), so its end sparks are there."""
+    by_name = {}
+    for ent in root.children("entity"):
+        name = (ent.get("targetname") or "").strip().lower()
+        if name and name not in by_name:
+            by_name[name] = _vec(ent.get("origin"))
+    beams = [e for e in root.children("entity") if e.classname in BEAM_CLASSES
+             and _spawnflags(e) & (BEAM_SPARK_START | BEAM_SPARK_END)]
+    if not beams:
+        return 0
+    tracer = BrushTracer(root)
+    max_id = max([_max_solid_id(root)] + [int(e.get("id", "0")) for e in root.children("entity")
+                                           if (e.get("id") or "").isdigit()])
+    insert_at = next((n for n, i in enumerate(root.items) if isinstance(i, VNode)
+                      and i.name.lower() in ("cameras", "cordon")), len(root.items))
+    added = 0
+    for ent in beams:
+        flags = _spawnflags(ent)
+        own = _vec(ent.get("origin"))
+        if ent.classname == "env_laser":
+            start, end = own, by_name.get((ent.get("LaserTarget") or "").strip().lower())
+        else:
+            start = by_name.get((ent.get("LightningStart") or "").strip().lower()) or own
+            end = by_name.get((ent.get("LightningEnd") or "").strip().lower())
+        if start is None or end is None:
+            continue
+        dist = math.dist(start, end)
+        if ent.classname == "env_laser" and dist > 1.0:
+            d = tuple((end[k] - start[k]) / dist for k in range(3))
+            hit = tracer.trace(start, d, dist)
+            if hit < dist - 1.0:
+                # just in front of the brush the laser hits
+                end = tuple(start[k] + d[k] * max(hit - 1.0, 0.0) for k in range(3))
+        name = (ent.get("targetname") or "").strip()
+        on = flags & BEAM_START_ON or not name
+        for flag, pos in ((BEAM_SPARK_START, start), (BEAM_SPARK_END, end)):
+            if not flags & flag:
+                continue
+            max_id += 1
+            e = VNode("entity")
+            e.items = [["id", str(max_id)], ["classname", "env_spark"], ["angles", "0 0 0"],
+                       ["MaxDelay", "0"], ["Magnitude", "1"], ["TrailLength", "1"],
+                       ["spawnflags", str(SPARK_SILENT | (SPARK_START_ON if on else 0))],
+                       ["origin", " ".join(_fmt(round(c, 2)) for c in pos)]]
+            if name:
+                e.items.append(["targetname", name])
+            root.items.insert(insert_at, e)
+            insert_at += 1
+            added += 1
+    return added
 
 
 # point_tesla looks this many ways for the surfaces its arcs end on
@@ -2525,7 +2723,7 @@ def _effect_props(ent, cls, tracer=None, lights=None):
         # data control point 1 = size of the box the puffs fill; the colors are in the particle
         return "smokevolume", tuple((mins[k] + maxs[k]) / 2 for k in range(3)), {
             "start_active": "1", "data_cp_value": " ".join(_fmt(v) for v in size),
-            "tint_cp_color": "255 255 255", "_params": _smokevolume_params(ent, num, size)}
+            "tint_cp_color": "255 255 255", "_params": _smokevolume_params(ent, num, size, mins, tracer)}
     if cls == "env_smoketrail":
         return "smoketrail", _vec(ent.get("origin")), {
             "start_active": "1", "data_cp_value": "0 0 0", "tint_cp_color": "255 255 255",
@@ -2600,7 +2798,7 @@ def _effects_to_particles(root, effects):
         cls = ent.classname
         if cls not in EFFECT_CLASSES:
             continue
-        if cls in ("point_spotlight", "beam_spotlight", "point_tesla") and tracer is None:
+        if cls in ("point_spotlight", "beam_spotlight", "point_tesla", "func_smokevolume") and tracer is None:
             tracer = BrushTracer(root)
             lights = _light_positions(root)
         made = _effect_props(ent, cls, tracer, lights)
@@ -2639,6 +2837,10 @@ def _remove_classes(root, classes=REMOVED_CLASSES):
     root.items = [i for i in root.items
                   if not (isinstance(i, VNode) and i.name.lower() == "entity" and i.classname in classes)]
     return before - len(root.items)
+
+
+# radius of assets/glow_particle.vpcf at scale 1
+LIGHTGLOW_RADIUS = 48.0
 
 
 def _sprite_alpha(ent):
@@ -2729,6 +2931,10 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
         if cls == "env_lightglow":
             ent.items[ent.index_of_key("classname")] = ["classname", "env_sprite"]
             _sprite_alpha(ent)
+            # its glow is HorizontalGlowSize / VerticalGlowSize units out from the middle; the
+            # glow particle is LIGHTGLOW_RADIUS at scale 1 (it was drawn 3 times too big)
+            size = max(_float(ent.get("HorizontalGlowSize"), 30.0), _float(ent.get("VerticalGlowSize"), 30.0))
+            ent.set("scale", _fmt(round(max(size, 1.0) / LIGHTGLOW_RADIUS, 3)))
             stats["particles"] += 1
         elif cls == "env_sprite_clientside":
             idx = ent.index_of_key("classname")
@@ -2746,6 +2952,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
             ent.items[ent.index_of_key("classname")] = ["classname", "info_target"]
             stats["landmarks"] += 1
 
+    stats["beam_sparks"] = _beam_sparks(root)
     stats["effects"] = _effects_to_particles(root, effects if effects is not None else {})
     stats["skiphint_removed"], stats["skiphint_replaced"] = _remove_skip_hint(root)
     if log:
@@ -2755,7 +2962,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks", "weaponstrip", "sky_nodraw"):
+                  "landmarks", "weaponstrip", "sky_nodraw", "beam_sparks"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

@@ -292,7 +292,9 @@ class Dialog:
         for i, key in enumerate(buttons):
             b = ttk.Button(inner, text=t("dlg_" + key), style="Accent.TButton" if i == 0 else "TButton",
                            command=lambda k=key: self._close(k))
-            b.pack(side="left", padx=(0 if i == 0 else int(8 * scale), 0))
+            # every button as big as the biggest one (the accent one has more padding)
+            b.grid(row=0, column=i, sticky="nsew", padx=int(4 * scale))
+            inner.columnconfigure(i, uniform="dlg_btn")
             first = first or b
         cancel = buttons[-1]
         top.bind("<Return>", lambda _e: self._close(buttons[0]))
@@ -944,6 +946,164 @@ def sort_tree_heading(tree, cols, labels, col, desc):
         tree.heading(c, text=labels[c] + arrow)
 
 
+class CubeEditor(ttk.Frame):
+    """The open cube of the Skybox Builder: six squares laid out like an unfolded cube. A click
+    on a square picks its image, an image dragged onto a square goes there, the x in its corner or
+    a right click empties it. faces: {face: path} (kept by the app)."""
+
+    CELL = 132
+    GAP = 6
+
+    def __init__(self, master, app, faces):
+        super().__init__(master, style="Inner.TFrame")
+        self.app, self.faces = app, faces
+        self._thumbs = {}
+        bar = ttk.Frame(self, style="Inner.TFrame")
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(bar, text=t("sb_name"), style="Inner.TLabel").pack(side="left")
+        self.v_name = tk.StringVar(value=app.cfg.get("sky_cube_name") or "skybox")
+        ttk.Entry(bar, textvariable=self.v_name, width=24).pack(side="left", padx=(6, 16))
+        self.v_name.trace_add("write", lambda *a: app._keep("sky_cube_name", self.v_name.get().strip()))
+        ttk.Button(bar, text=t("fl_clear"), command=self.clear).pack(side="left")
+        ttk.Label(bar, text=t("sb_hint"), style="InnerMuted.TLabel").pack(side="left", padx=(16, 0))
+        step = self.CELL + self.GAP
+        self.canvas = tk.Canvas(self, width=4 * step + self.GAP, height=3 * step + self.GAP, bg=CARD,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(anchor="w")
+        self.canvas.drop_paths = self.drop_paths
+        self.canvas.bind("<Button-1>", self._click)
+        self.canvas.bind("<Button-3>", self._clear_one)
+        self.canvas.bind("<Motion>", self._hover)
+        self.canvas.bind("<Leave>", lambda e: self._hover(None))
+        self._hot = self._hot_x = None
+        self.draw()
+
+    def _box(self, face):
+        col, row = tools.CUBE_CELLS[face]
+        step = self.CELL + self.GAP
+        x, y = self.GAP + col * step, self.GAP + row * step
+        return x, y, x + self.CELL, y + self.CELL
+
+    def _face_at(self, x, y):
+        for face in tools.CUBE_CELLS:
+            x0, y0, x1, y1 = self._box(face)
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return face
+        return None
+
+    def _x_box(self, face):
+        """The small remove button in the top right corner of a square that has an image."""
+        x0, y0, x1, y1 = self._box(face)
+        return x1 - 24, y0 + 4, x1 - 4, y0 + 24
+
+    def _on_x(self, face, x, y):
+        if not face or not self.faces.get(face):
+            return False
+        x0, y0, x1, y1 = self._x_box(face)
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _thumb(self, face):
+        path = self.faces.get(face)
+        if not path:
+            return None
+        key = (face, path)
+        if key not in self._thumbs:
+            try:
+                from PIL import Image, ImageTk
+                # stretched to a square like the face it becomes
+                img = tools._open_image(path).convert("RGB")
+                self._thumbs[key] = ImageTk.PhotoImage(img.resize((self.CELL - 4, self.CELL - 4), Image.LANCZOS))
+            except Exception:  # noqa: BLE001 - an unreadable image shows as empty
+                self._thumbs[key] = None
+        return self._thumbs[key]
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+        for face in tools.CUBE_CELLS:
+            x0, y0, x1, y1 = self._box(face)
+            hot = face == self._hot
+            img = self._thumb(face)
+            c.create_rectangle(x0, y0, x1, y1, fill=FIELD if not hot else HOVER,
+                               outline=ACCENT if hot else BORDER, width=2 if hot else 1,
+                               dash=() if img else (4, 3))
+            label = t("sb_face_" + face)
+            if img:
+                c.create_image(x0 + 2, y0 + 2, image=img, anchor="nw")
+                c.create_rectangle(x0 + 2, y1 - 22, x1 - 2, y1 - 2, fill=PANEL, outline="")
+                c.create_text((x0 + x1) / 2, y1 - 12, text=label, fill=FG)
+            else:
+                c.create_text((x0 + x1) / 2, (y0 + y1) / 2 - 8, text=label, fill=FG)
+                c.create_text((x0 + x1) / 2, (y0 + y1) / 2 + 12, text=t("sb_pick"), fill=MUTED)
+            if self.faces.get(face):
+                bx0, by0, bx1, by1 = self._x_box(face)
+                on = face == self._hot_x
+                c.create_rectangle(bx0, by0, bx1, by1, fill=ACCENT if on else PANEL,
+                                   outline=ACCENT if on else BORDER)
+                c.create_line(bx0 + 6, by0 + 6, bx1 - 6, by1 - 6, fill=FG, width=2)
+                c.create_line(bx0 + 6, by1 - 6, bx1 - 6, by0 + 6, fill=FG, width=2)
+
+    def _hover(self, e):
+        face = self._face_at(e.x, e.y) if e is not None else None
+        on_x = face if e is not None and self._on_x(face, e.x, e.y) else None
+        if face != self._hot or on_x != self._hot_x:
+            self._hot, self._hot_x = face, on_x
+            self.canvas.configure(cursor="hand2" if face else "")
+            self.draw()
+
+    def _set(self, face, path):
+        if path:
+            self.faces[face] = os.path.normpath(path)
+        else:
+            self.faces.pop(face, None)
+        self.app._keep("sky_cube", dict(self.faces))
+        self.draw()
+
+    def _click(self, e):
+        face = self._face_at(e.x, e.y)
+        if face is None:
+            return
+        if self._on_x(face, e.x, e.y):
+            self._hot_x = None
+            self._set(face, None)
+            return
+        exts =" ".join("*" + x for x in tools._IMAGE_EXTS)
+        init = self.app.cfg.get("last_tool_dir") or os.path.expanduser("~")
+        p = filedialog.askopenfilename(parent=self, initialdir=init if os.path.isdir(init) else None,
+                                       title=t("sb_face_" + face),
+                                       filetypes=[(t("fl_types"), exts), (t("all_files"), "*.*")])
+        if p:
+            self.app._keep("last_tool_dir", os.path.dirname(p))
+            self._set(face, p)
+
+    def _clear_one(self, e):
+        face = self._face_at(e.x, e.y)
+        if face:
+            self._set(face, None)
+
+    def clear(self):
+        self.faces.clear()
+        self.app._keep("sky_cube", {})
+        self.draw()
+
+    def drop_paths(self, paths):
+        """Dragged images: one goes to the square under the pointer; several fill the empty
+        squares in order (up, left, front, right, back, down)."""
+        imgs = [p for p in paths if os.path.isfile(p) and p.lower().endswith(tools._IMAGE_EXTS)]
+        if not imgs:
+            self.app._msg(t("drop_title"), t("sb_drop_images"), "info")
+            return
+        px, py = self.canvas.winfo_pointerxy()
+        face = self._face_at(px - self.canvas.winfo_rootx(), py - self.canvas.winfo_rooty())
+        if face and len(imgs) == 1:
+            self._set(face, imgs[0])
+            return
+        order = [f for f in ("up", "lf", "ft", "rt", "bk", "dn") if f not in self.faces] or list(tools.CUBE_CELLS)
+        for f, p in zip(order, imgs):
+            self.faces[f] = os.path.normpath(p)
+        self._set(order[0], self.faces.get(order[0]))
+
+
 class FileList(ttk.Frame):
     """The rows a tool converts: files added with the buttons or dragged onto the list, or
     folders and .zip files searched for the files the tool takes. Every row opens to the files it
@@ -1482,9 +1642,6 @@ class App:
         self.tool_rows = {}
         # every tool's output folder, also only while the program runs (never saved)
         self._tool_outs = {}
-        for v in self.cfg.get("tool_paths", {}).values():
-            if isinstance(v, dict):
-                v.pop("out", None)
         self.file_list = None
         # Missing Assets: the map checked, what it misses and what of that was found
         self.miss_state = {"vmap": "", "addon": "", "missing": ([], []), "found": ([], [])}
@@ -1853,6 +2010,14 @@ class App:
                     font=("Segoe UI Semibold", 9), bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD)
         s.map("Lang.Toolbutton", background=[("selected", ACCENT), ("active", HOVER)],
               foreground=[("selected", ON_ACCENT)])
+        # a choice between two ways (Skybox Builder): framed like a button, the chosen one in accent
+        s.configure("Mode.Toolbutton", background=CARD, foreground=FG, bordercolor=BORDER, lightcolor=CARD,
+                    darkcolor=CARD, padding=(14, 5), anchor="center", font=("Segoe UI", 10), relief="solid",
+                    borderwidth=1)
+        s.map("Mode.Toolbutton", background=[("active", HOVER)], foreground=[("selected", ACCENT)],
+              bordercolor=[("selected", ACCENT), ("active", MUTED)])
+        s.layout("Mode.Toolbutton", [("Button.border", {"sticky": "nswe", "border": "1", "children": [
+            ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})])
         # no dotted focus ring: a tab click moves the focus to the first button of the tab, which made
         # the first tool look selected
         for name in ("Nav.Toolbutton", "Lang.Toolbutton"):
@@ -2131,7 +2296,8 @@ class App:
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self._addons_tab_shown(), add="+")
         # files dropped on a tab (not on one of its parts) go here
         self.tab_port.drop_paths = self._drop_maps
-        self.tab_tools.drop_paths = lambda paths: self.file_list.add_paths(paths) if self.file_list else None
+        self.tab_tools.drop_paths = lambda paths: self.file_list.add_paths(paths) if self.file_list else (
+            self.cube_editor.drop_paths(paths) if getattr(self, "cube_editor", None) is not None else None)
         self.tab_settings.drop_paths = self._res_add_dirs
 
         bottom = ttk.Frame(paned)
@@ -2702,8 +2868,17 @@ class App:
         busy = self.busy()
         p = self.tool_panel
         ttk.Label(p, text=t(td["name"]), style="InnerSection.TLabel").pack(anchor="w", padx=16, pady=(14, 2))
-        ttk.Label(p, text=t(td["desc"]), style="Inner.TLabel", wraplength=860,
+        cube = td["id"] == "skybox" and self.cfg.get("sky_mode") == "cube"
+        ttk.Label(p, text=t("sb_cube_desc" if cube else td["desc"]), style="Inner.TLabel", wraplength=860,
                   justify="left").pack(anchor="w", padx=16, pady=(0, 10))
+        if td["id"] == "skybox":
+            # two ways to make a sky: from Source 1 faces, or from the user's own images
+            mrow = ttk.Frame(p, style="Inner.TFrame")
+            mrow.pack(anchor="w", padx=16, pady=(0, 10))
+            self.v_sky_mode = tk.StringVar(value="cube" if cube else "faces")
+            for value, key in (("faces", "sb_mode_faces"), ("cube", "sb_mode_cube")):
+                ttk.Radiobutton(mrow, text=t(key), value=value, variable=self.v_sky_mode, style="Mode.Toolbutton",
+                                command=self._sky_mode_changed).pack(side="left", padx=(0, 6))
 
         # bottom up: the buttons, the options and the output folder; the list takes the rest
         act = ttk.Frame(p, style="Inner.TFrame")
@@ -2745,8 +2920,43 @@ class App:
         ttk.Button(orow, text=t("browse"), command=lambda: self._pick_dir(self.v_tout)).pack(side="left")
         self.v_tout.trace_add("write", lambda *a: self._keep_tool_out(td["id"]))
 
+        if cube:
+            self.file_list = None
+            # the cube scrolls when the log leaves too little room for it
+            sf = ScrollFrame(p, style="Inner.TFrame", bg=CARD)
+            sf.pack(fill="both", expand=True, padx=16)
+            self.cube_editor = CubeEditor(sf.inner, self, dict(self.cfg.get("sky_cube") or {}))
+            self.cube_editor.pack(fill="both", expand=True)
+            return
+        self.cube_editor = None
         self.file_list = FileList(p, self, td, self.tool_rows.setdefault(td["id"], []))
         self.file_list.pack(fill="both", expand=True, padx=16)
+
+    def _sky_mode_changed(self):
+        self._keep("sky_mode", self.v_sky_mode.get())
+        self._tool_selected()
+
+    def _run_sky_cube(self, td):
+        """Skybox Builder with the open cube: one sky from the images on it."""
+        faces = dict(self.cube_editor.faces) if self.cube_editor is not None else {}
+        if not faces:
+            self._msg(t(td["name"]), t("sb_no_faces"), "warning")
+            return
+        out = self.v_tout.get().strip()
+        if not out:
+            self._msg(t(td["name"]), t("tool_need_out"), "warning")
+            return
+        opts = {k: bool(v.get()) for k, v in self.tool_vars.items()}
+        sky_name = self.cube_editor.v_name.get()
+        title = t(td["name"])
+
+        def job(ctx):
+            ctx.log(t("sb_job", out=out), "head")
+            done = tools.run_sky_cube(faces, sky_name, out, opts, ctx.log)
+            if done:
+                ctx.log(t("tool_done", name=title), "ok")
+
+        self._start_job(job, title, None, indeterminate=True)
 
     def _keep_tool_out(self, tid):
         self._tool_outs[tid] = self.v_tout.get().strip()
@@ -2762,12 +2972,18 @@ class App:
         """A folder dropped on the output field becomes the output folder."""
         d = next((p for p in paths if os.path.isdir(p)), None)
         if d is None:
-            self.file_list.add_paths(paths)
+            if self.file_list is not None:
+                self.file_list.add_paths(paths)
+            elif getattr(self, "cube_editor", None) is not None:
+                self.cube_editor.drop_paths(paths)
             return
         self.v_tout.set(os.path.normpath(d))
 
     def _run_tool(self):
         td = tools.tool_by_id(self.v_tool.get())
+        if td["id"] == "skybox" and getattr(self, "cube_editor", None) is not None:
+            self._run_sky_cube(td)
+            return
         rows = list(self.tool_rows.get(td["id"], []))
         if not rows:
             self._msg(t(td["name"]), t("tool_need_files"), "warning")

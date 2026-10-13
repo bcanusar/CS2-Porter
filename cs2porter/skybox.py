@@ -13,6 +13,7 @@ pixels along every shared edge: the arrangement with the smallest seams wins.
 
 import itertools
 import os
+import re
 
 import numpy as np
 from PIL import Image
@@ -27,6 +28,16 @@ FACES = SIDES + ("up", "dn")
 SKY_VMAT = "materials/skybox/skybox.vmat"
 MOONDOME_VMAT = "materials/skybox/skybox_moondome.vmat"
 SKY_PNG = "materials/skybox/skybox.png"
+
+
+def sky_paths(map_name=""):
+    """(sky vmat, moondome vmat, png) of a map. With a map name they get it as a suffix
+    (skybox_<map>.vmat ...), so maps sharing an addon keep their own skies."""
+    if not map_name:
+        return SKY_VMAT, MOONDOME_VMAT, SKY_PNG
+    sfx = "_" + re.sub(r"[^a-z0-9_]+", "_", map_name.lower()).strip("_")
+    return (f"materials/skybox/skybox{sfx}.vmat", f"materials/skybox/skybox_moondome{sfx}.vmat",
+            f"materials/skybox/skybox{sfx}.png")
 
 SKY_TEMPLATE = """// THIS FILE IS AUTO-GENERATED
 
@@ -475,8 +486,9 @@ def draw_suns(faces, suns, sources, vtfcmd=None, size=FACE_SIZE, sky_angles=None
 
 
 def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, log=None, moondome=True,
-                 suns=None, sky_angles=None):
-    """Writes skybox.png, skybox.vmat and (moondome) skybox_moondome.vmat. Returns (status, detail).
+                 suns=None, sky_angles=None, paths=None):
+    """Writes skybox.png, skybox.vmat and (moondome) skybox_moondome.vmat, or the names in paths
+    (see sky_paths). Returns (status, detail).
     suns: the map's env_sun entities (see suns_of), drawn into the sky where the CS2 map's
     env_sky (angles sky_angles, None: 0 0 0) shows their direction."""
     log = log or (lambda m, tag="info": None)
@@ -484,7 +496,8 @@ def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, lo
     if not sky:
         return "skip", t("sk_no_sky")
     out_dir = os.path.join(content_dir, "materials", "skybox")
-    vmats = [os.path.join(content_dir, *p.split("/")) for p in (SKY_VMAT, MOONDOME_VMAT, SKY_PNG)]
+    sky_png = (paths or sky_paths())[2]
+    vmats = [os.path.join(content_dir, *p.split("/")) for p in (paths or sky_paths())]
     needed = vmats if moondome else (vmats[0], vmats[2])
     if not overwrite and all(os.path.isfile(p) for p in needed):
         return "exists", t("m_exists")
@@ -509,12 +522,12 @@ def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, lo
                   yaw=f"{np.degrees(np.arctan2(d[1], d[0])):.0f}",
                   size=f"{sun['size']:g}"), "dim")
     os.makedirs(out_dir, exist_ok=True)
-    compose(faces, ring, up_rot, dn_rot).save(os.path.join(content_dir, *SKY_PNG.split("/")), "PNG")
+    compose(faces, ring, up_rot, dn_rot).save(vmats[2], "PNG")
     with open(vmats[0], "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(SKY_TEMPLATE % {"png": SKY_PNG})
+        fh.write(SKY_TEMPLATE % {"png": sky_png})
     if moondome:
         with open(vmats[1], "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(MOONDOME_TEMPLATE % {"png": SKY_PNG})
+            fh.write(MOONDOME_TEMPLATE % {"png": sky_png})
     missing = [f for f in FACES if f not in faces]
     detail = t("sk_faces", n=len(faces)) + (t("sk_missing_faces", list=", ".join(missing)) if missing else "")
     if suns:

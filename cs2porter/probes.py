@@ -123,11 +123,36 @@ def _split(cells, out, max_cells):
     _split(right, out, max_cells)
 
 
-def volumes(boxes):
-    """[(mins, maxs)] of the volumes that cover the geometry."""
+def _air_cells(cells, air_boxes):
+    """Cells of the open space inside the sealed map (the compiled map's empty leaves) within the
+    geometry's bounds. Without them a big room's middle was an empty slab between two parts of
+    the map, the split cut the map there and no volume covered the room's air."""
+    if not cells or not air_boxes:
+        return set()
+    lo = [min(c[k] for c in cells) for k in range(3)]
+    hi = [max(c[k] for c in cells) for k in range(3)]
+    out = set()
+    for blo, bhi in air_boxes:
+        a = [max(int(math.floor(blo[k] / CELL)), lo[k]) for k in range(3)]
+        b = [min(int(math.floor(bhi[k] / CELL)), hi[k]) for k in range(3)]
+        if any(a[k] > b[k] for k in range(3)):
+            continue
+        if (b[0] - a[0] + 1) * (b[1] - a[1] + 1) * (b[2] - a[2] + 1) > 200000:
+            continue
+        for x in range(a[0], b[0] + 1):
+            for y in range(a[1], b[1] + 1):
+                for z in range(a[2], b[2] + 1):
+                    out.add((x, y, z))
+    return out
+
+
+def volumes(boxes, air_boxes=None):
+    """[(mins, maxs)] of the volumes that cover the geometry and the open space between it
+    (air_boxes: lighting.BspTracer.air_boxes)."""
     cells = _cells(boxes)
     if not cells:
         return []
+    cells |= _air_cells(cells, air_boxes)
     parts = []
     _split(list(cells), parts, max(1, int((MAX_SIZE - 2 * EDGE_FADE) // CELL)))
     out = []
@@ -279,7 +304,9 @@ class _Placer:
 def plan(root, tracer=None):
     """[(volume mins, volume maxs, room center or None)] for the map. tracer: lighting.BspTracer
     of the compiled map; without it the rooms go under the map."""
-    vols = volumes(geometry_boxes(root))
+    # a map that leaks has no space outside it: its whole box would count as open space
+    air = tracer.air_boxes if tracer is not None and tracer.world is not None and tracer.void_boxes else None
+    vols = volumes(geometry_boxes(root), air)
     if not vols:
         return []
     out = []

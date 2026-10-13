@@ -544,6 +544,51 @@ def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
     log(t("tl_result", ok=ok, skip=skip, fail=fail), "ok" if not fail else "warn")
 
 
+# the open cube of the Skybox Builder: face -> (column, row) in a 4 x 3 grid, as a cube unfolds
+# around its front face (the back face is right of the right one)
+CUBE_CELLS = {"up": (1, 0), "lf": (0, 1), "ft": (1, 1), "rt": (2, 1), "bk": (3, 1), "dn": (1, 2)}
+CUBE_RING = ("lf", "ft", "rt", "bk")
+CUBE_BIG = 2048
+
+
+def run_sky_cube(faces, name, out, opts, log):
+    """Images the user put on the open cube ({face: path}) -> the same CS2 sky as from Source 1
+    faces (skybox.png, skybox.vmat, skybox_moondome.vmat in out/name). Every image is stretched to
+    the square face size (nothing is cut off): 2048 when every image is at least that big, else
+    1024. A face without an image (or with one that cannot be read) is black. Returns the
+    folder, or None."""
+    from PIL import Image
+    from . import skybox as skymod
+    name = re.sub(r"[^\w\-]+", "_", (name or "").strip()).strip("_") or "skybox"
+    dst = os.path.join(out, name)
+    png = os.path.join(dst, "skybox.png")
+    if os.path.isfile(png) and not opts.get("overwrite", False):
+        log(t("sb_exists", f=dst), "warn")
+        return None
+    imgs = {}
+    for face in CUBE_CELLS:
+        path = faces.get(face)
+        if not path:
+            continue
+        try:
+            imgs[face] = _open_image(path).convert("RGB")
+        except Exception as e:  # noqa: BLE001 - the face is filled black like an empty one
+            log(t("tl_error", f=os.path.basename(path), e=e), "warn")
+    size = CUBE_BIG if imgs and min(min(i.size) for i in imgs.values()) >= CUBE_BIG else skymod.FACE_SIZE
+    missing = [f for f in CUBE_CELLS if f not in imgs]
+    full = dict(imgs, **{f: Image.new("RGB", (size, size)) for f in missing})
+    os.makedirs(dst, exist_ok=True)
+    skymod.compose(full, CUBE_RING, 0, 0, size).save(png, "PNG")
+    with open(os.path.join(dst, "skybox.vmat"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(skymod.SKY_TEMPLATE % {"png": skymod.SKY_PNG})
+    with open(os.path.join(dst, "skybox_moondome.vmat"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(skymod.MOONDOME_TEMPLATE % {"png": skymod.SKY_PNG})
+    log(t("sb_done", f=dst, n=len(imgs), size=size), "ok")
+    if missing:
+        log(t("sb_empty_faces", list=", ".join(t("sb_face_" + f) for f in missing)), "info")
+    return dst
+
+
 def _fbx_runner(kind):
     def run(items, out, opts, log, cfg=None, cancel=None, status=None):
         """Polyhaven / Megascans models (FBX with their textures) -> .vmdl and .vmat. Every row

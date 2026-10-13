@@ -113,7 +113,8 @@ def rename_inputs(text, names, mapping, stats=None, unsupported=()):
 
 def glow_vpcf(mat):
     """Glow particle that draws with the texture of the sprite material mat."""
-    return f"particles/cs2porter/glow_{re.sub(r'[^a-z0-9_]+', '_', out_name(mat).lower()).strip('_')}.vpcf"
+    name = re.sub(r'[^a-z0-9_]+', '_', out_name(mat).lower()).strip('_')
+    return f"particles/cs2porter/glow_{name}.vpcf"
 
 
 def _sprite_material(name):
@@ -129,7 +130,7 @@ BEAM_INPUTS = {"turnon": "Start", "turnoff": "DestroyImmediately"}
 
 def convert_glows(text, stats, sprite_textures=None, glow_particles=None, renames=None):
     """sprite_textures: {sprite material: texture}; glow_particles receives {vpcf: texture} for
-    the glows that got a particle drawing with their own sprite texture; renames receives
+    the glows that got a particle of their own (their sprite texture); renames receives
     (names, input mapping) for the inputs sent to them from the map's other files."""
     if '"env_particle_glow"' not in text:
         return text
@@ -137,7 +138,7 @@ def convert_glows(text, stats, sprite_textures=None, glow_particles=None, rename
     if renames is not None:
         renames.append((names, GLOW_INPUTS))
 
-    def fn(p, _origin):
+    def fn(p, origin):
         if p.get("classname") != "env_particle_glow":
             return None
         stats["glows"] += 1
@@ -148,10 +149,11 @@ def convert_glows(text, stats, sprite_textures=None, glow_particles=None, rename
         illum = _float(p.get("selfillumscale"), 1.0)
         effect = GLOW_VPCF
         mat = _sprite_material(p.get("s1 env_sprite material"))
-        if sprite_textures and mat in sprite_textures:
+        tex = sprite_textures.get(mat) if sprite_textures else None
+        if tex:
             effect = glow_vpcf(mat)
             if glow_particles is not None:
-                glow_particles[effect] = sprite_textures[mat]
+                glow_particles[effect] = tex
         return {"classname": "info_particle_system", "effect_name": effect,
                 "start_active": p.get("start_active") or "1",
                 "data_cp": "1", "data_cp_value": cp_text(f"{_num(alpha)} {_num(scale)} {_num(illum)}"),
@@ -174,7 +176,7 @@ def convert_elements(text, fx, stats):
     text has what it looks for)."""
     steps, after = [], []
     if '"env_beam"' in text or '"env_laser"' in text:
-        fn, names = _beam_step(stats)
+        fn, names = _beam_step(stats, getattr(fx, "beam_particles", None))
         steps.append(fn)
         after.append(lambda tx: rename_inputs(tx, names, BEAM_INPUTS, stats, ("toggle",)))
         renames = getattr(fx, "renames", None)
@@ -210,13 +212,19 @@ def convert_elements(text, fx, stats):
 # env_beam / env_laser
 # ---------------------------------------------------------------------------
 
-def convert_beams(text, stats):
-    fn, names = _beam_step(stats)
+def beam_vpcf(mat):
+    """Beam particle that draws with the texture of the beam material mat."""
+    return f"particles/cs2porter/beam_{re.sub(r'[^a-z0-9_]+', '_', out_name(mat).lower()).strip('_')}.vpcf"
+
+
+def convert_beams(text, stats, beam_particles=None):
+    fn, names = _beam_step(stats, beam_particles)
     text, _ch = transform_world(text, fn)
     return rename_inputs(text, names, BEAM_INPUTS, stats, ("toggle",))
 
 
-def _beam_step(stats):
+def _beam_step(stats, beam_particles=None):
+    """beam_particles receives {vpcf: beam material} for the beams that draw their own texture."""
     names = set()
 
     def fn(e):
@@ -227,6 +235,7 @@ def _beam_step(stats):
         if cls not in ("env_beam", "env_laser"):
             return None
         stats["beams_found"] += 1
+        mat = _sprite_material(p.get("texture"))
         if cls == "env_beam":
             start, end, width = p.get("lightningstart", ""), p.get("lightningend", ""), p.get("boltwidth")
         else:
@@ -243,8 +252,13 @@ def _beam_step(stats):
         # Source 1 beams (beamdraw.cpp) repeat their texture every 100 units and scroll it
         # TextureScroll / 10 times a second: TextureScroll * 10 units a second
         scroll = round(_float(p.get("texturescroll"), 35.0) * BEAM_SCROLL_UNITS, 2)
-        changes = {"classname": "info_particle_system", "effect_name": BEAM_VPCF,
-                   "start_active": "1" if flags & 1 else "0",
+        effect = BEAM_VPCF
+        if mat and beam_particles is not None:
+            effect = beam_vpcf(mat)
+            beam_particles[effect] = mat
+        changes = {"classname": "info_particle_system", "effect_name": effect,
+                   # a beam without a name is always on in Source 1
+                   "start_active": "1" if flags & 1 or not (p.get("targetname") or "").strip() else "0",
                    "cpoint1": end.strip(), "data_cp": "3",
                    "data_cp_value": cp_text(f"{_num(radius)} {_num(alpha)} {_num(scroll)}"),
                    "tint_cp": "2", "tint_cp_color": color_text(p.get("rendercolor"))}

@@ -84,6 +84,7 @@ class Fixes:
         # sprite material -> its converted texture ('materials/x.tga'): glows draw with it
         self.sprite_textures = sprite_textures or {}
         self.glow_particles = {}            # filled by the glow step: vpcf -> texture
+        self.beam_particles = {}            # filled by the beam step: vpcf -> beam material
         # filled by the glow / beam steps: (names, input mapping) renamed in every file
         self.renames = []
         # infodecals and the faces they sit on (vmf.decal_surfaces)

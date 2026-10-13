@@ -295,6 +295,24 @@ def unlit_vmat(color, translucency=None, blend=0, tint=None, scroll=None, backfa
     return "\n".join(lines) + "}\n"
 
 
+def additive_vmat(color, scroll=None):
+    """csgo_effects material that adds its texture to what is behind it (F_ADDITIVE_BLEND, as
+    Valve's de_nuke skylight tint): Source 1 $additive. Tint and translucency are already in
+    the texture (see _additive_light). scroll: (u, v) per second."""
+    T = "\t"
+    su, sv = (round(c, 3) + 0.0 for c in (scroll or (0.0, 0.0)))     # + 0.0: no "-0.000"
+    return "\n".join([
+        "// THIS FILE IS AUTO-GENERATED", "", "Layer0", "{", f'{T}shader "csgo_effects.vfx"', "",
+        f"{T}//---- Features ----", f"{T}F_ADDITIVE_BLEND 1", f"{T}F_DO_NOT_CAST_SHADOWS 1", "",
+        f"{T}//---- Color ----",
+        f'{T}g_vColorTint "[1.000000 1.000000 1.000000 0.000000]"',
+        f'{T}g_vTexCoordScrollSpeed "[{su:.3f} {sv:.3f}]"',
+        f'{T}TextureColor "{color}"', "",
+        f"{T}//---- Fog ----", f'{T}g_bFogEnabled "1"', "",
+        f"{T}//---- Translucent ----", f'{T}g_flOpacityScale "1.000"',
+        f'{T}TextureTranslucency "[1.000000 1.000000 1.000000 0.000000]"', "", "}", ""])
+
+
 def vmt_color(vmt, key="$color"):
     """$color (or another color key) as (r, g, b) with 1 = full, None when not set."""
     raw = (vmt.get(key) or "").strip()
@@ -729,6 +747,26 @@ def mip_fade(sources, mat):
     return first, gone
 
 
+def blends_behind(sources, mat):
+    """True for a Source 1 material that mixes with what is behind it ($translucent, $additive
+    or $alpha below 1): two faces of it on top of each other look stronger than one."""
+    rel = f"materials/{mat}.vmt"
+    data, _src = sources.read(rel)
+    if not data:
+        return False
+    try:
+        vmt = parse_vmt(data, rel, lambda r: sources.read(r)[0])
+    except Exception:  # noqa: BLE001 - a broken VMT is reported by the material step
+        return False
+    _sprite_blend(vmt)
+    if vmt.flag("$translucent") or vmt.flag("$additive"):
+        return True
+    try:
+        return float(vmt.get("$alpha", "1")) < 0.999
+    except (TypeError, ValueError):
+        return False
+
+
 def _fallback_base(vmt):
     """$basetexture of a fallback block ("lightmappedgeneric_dx6" { ... }) that is a real texture."""
     if vmt.block is None:
@@ -751,6 +789,23 @@ def _floats(text, scale=1.0):
         except ValueError:
             pass
     return out
+
+
+# Sprite shader blending by $spriterendermode (kRenderTransColor / TransTexture / TransAlpha
+# blend by alpha, Glow / TransAdd / WorldGlow add): written as $translucent / $additive, the
+# keys the other shaders use (effects/blueblacklargebeam on brush faces was drawn opaque)
+SPRITE_TRANSLUCENT_MODES = ("1", "2", "4")
+SPRITE_ADDITIVE_MODES = ("3", "5", "9")
+
+
+def _sprite_blend(vmt):
+    if vmt.shader not in ("sprite", "spritecard"):
+        return
+    mode = (vmt.get("$spriterendermode") or "").strip()
+    if mode in SPRITE_ADDITIVE_MODES:
+        vmt.params.setdefault("$additive", "1")
+    elif mode in SPRITE_TRANSLUCENT_MODES:
+        vmt.params.setdefault("$translucent", "1")
 
 
 def is_water(vmt):
@@ -1037,6 +1092,7 @@ class MaterialConverter:
             return MaterialResult(mat, "error", t("m_vmt_error", e=e), src.label)
 
         shader = vmt.shader
+        _sprite_blend(vmt)
         if shader in ("sky", "skybox"):
             return MaterialResult(mat, "unsupported", t("m_sky"), src.label)
         fade = proximity_fade(vmt)
@@ -1135,6 +1191,46 @@ class MaterialConverter:
         except (OSError, ValueError):
             return color
 
+    def _added_light(self, color, trans, tint):
+        """What an additive surface adds to what is behind it: texture x tint x translucency
+        (0..1 RGB array). None when the texture can not be read."""
+        if color.startswith("["):
+            return None
+        try:
+            with Image.open(self._abs(color)) as img:
+                rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+            light = rgb * np.asarray([max(c, 0.0) for c in tint], dtype=np.float32)
+            if trans and not trans.startswith("["):
+                with Image.open(self._abs(trans)) as m:
+                    m = m.convert("L")
+                    if m.size != (rgb.shape[1], rgb.shape[0]):
+                        m = m.resize((rgb.shape[1], rgb.shape[0]), Image.BILINEAR)
+                    light *= (np.asarray(m, dtype=np.float32) / 255.0)[..., None]
+            return np.clip(light, 0.0, 1.0)
+        except (OSError, ValueError):
+            return None
+
+    def _additive_light(self, color, trans, tint):
+        """Color texture of an additive_vmat: the added light (_added_light), the same texture
+        when tint and translucency change nothing. None when the texture can not be read."""
+        if color.startswith("["):
+            return None
+        if not (trans and not trans.startswith("[")) and all(abs(c - 1.0) < 1e-3 for c in tint):
+            return color
+        tag = "".join(f"{min(max(int(round(c * 255)), 0), 255):02x}" for c in tint)
+        out = color.rsplit(".", 1)[0] + f"_light_{tag}.tga"
+        if os.path.isfile(self._abs(out)):
+            return out
+        light = self._added_light(color, trans, tint)
+        if light is None:
+            return None
+        try:
+            os.makedirs(os.path.dirname(self._abs(out)), exist_ok=True)
+            Image.fromarray((light * 255 + 0.5).astype(np.uint8), "RGB").save(self._abs(out))
+            return out
+        except (OSError, ValueError):
+            return None
+
     def _additive_layers(self, color, trans, tint):
         """(color texture, translucency texture) of a translucent surface that looks like an
         additive one: the added light (texture x tint x translucency) divided by its brightest
@@ -1146,17 +1242,10 @@ class MaterialConverter:
         out_c, out_m = base + ".tga", base + "_mask.tga"
         if os.path.isfile(self._abs(out_c)) and os.path.isfile(self._abs(out_m)):
             return out_c, out_m
+        light = self._added_light(color, trans, tint)
+        if light is None:
+            return None
         try:
-            with Image.open(self._abs(color)) as img:
-                rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-            light = rgb * np.asarray([max(c, 0.0) for c in tint], dtype=np.float32)
-            if trans and not trans.startswith("["):
-                with Image.open(self._abs(trans)) as m:
-                    m = m.convert("L")
-                    if m.size != (rgb.shape[1], rgb.shape[0]):
-                        m = m.resize((rgb.shape[1], rgb.shape[0]), Image.BILINEAR)
-                    light *= (np.asarray(m, dtype=np.float32) / 255.0)[..., None]
-            light = np.clip(light, 0.0, 1.0)
             peak = light.max(axis=2)
             col = np.where(peak[..., None] > 1e-4, light / np.maximum(peak, 1e-4)[..., None], 0.0)
             os.makedirs(os.path.dirname(self._abs(out_c)), exist_ok=True)
@@ -1504,27 +1593,33 @@ class MaterialConverter:
                 additive = vmt.flag("$additive")
                 blend = 0
                 trans_tex = trans if transparent and trans else None
+                light = None
                 if additive:
                     tint = [c * alpha for c in tint]
-                    # CS2 draws the Additive blend mode of csgo_unlitgeneric white: the added
-                    # light becomes a translucent layer (its color at full strength, as opaque
-                    # as it is bright)
-                    layers = self._additive_layers(color, trans_tex, tint)
-                    if layers:
-                        color, trans_tex = layers
-                        tint = [1.0, 1.0, 1.0]
-                        blend = UNLIT_BLEND_TRANSLUCENT
-                    else:
-                        blend = UNLIT_BLEND_ADDITIVE
+                    # CS2 draws the Additive blend mode of csgo_unlitgeneric white; csgo_effects
+                    # adds for real (the background stays visible, as in Source 1)
+                    light = self._additive_light(color, trans_tex, tint)
+                    if light is None:
+                        # unreadable texture: a translucent layer as opaque as it is bright
+                        layers = self._additive_layers(color, trans_tex, tint)
+                        if layers:
+                            color, trans_tex = layers
+                            tint = [1.0, 1.0, 1.0]
+                            blend = UNLIT_BLEND_TRANSLUCENT
+                        else:
+                            blend = UNLIT_BLEND_ADDITIVE
                 elif trans_tex or alpha < 0.999:
                     blend = UNLIT_BLEND_TRANSLUCENT
                     if not trans_tex:
                         trans_tex = f"[{alpha:.6f} {alpha:.6f} {alpha:.6f} 0.000000]"
-                tinted = self._tinted(color, tint)
-                if tinted != color:
-                    color, tint = tinted, [1.0, 1.0, 1.0]
-                content = unlit_vmat(color, translucency=trans_tex, blend=blend, tint=tint, scroll=scroll,
-                                     backfaces=vmt.flag("$nocull"))
+                if light is not None:
+                    content = additive_vmat(light, scroll=scroll)
+                else:
+                    tinted = self._tinted(color, tint)
+                    if tinted != color:
+                        color, tint = tinted, [1.0, 1.0, 1.0]
+                    content = unlit_vmat(color, translucency=trans_tex, blend=blend, tint=tint, scroll=scroll,
+                                         backfaces=vmt.flag("$nocull"))
                 tag = "unlit" + (" + additive" if additive else " + translucent" if blend else "") + \
                     (" + " + t("m_scroll") if scroll else "")
             elif scroll:

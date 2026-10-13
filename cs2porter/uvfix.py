@@ -22,7 +22,7 @@ from .blend import _MESH_RE, _array, _block, _close, _stream
 
 _TEX_KEYS = ("TextureColor", "TextureLayer1Color", "TextureNormal", "TextureLayer1Normal")
 _MATS_RE = re.compile(r'"materials" "string_array" *\r?\n[ \t]*\[(.*?)\]', re.S)
-_SEE_THROUGH_RE = re.compile(r'^\s*"?(F_TRANSLUCENT|F_ALPHA_TEST|F_BLEND_MODE)"?\s+"?[1-9]', re.M)
+_SEE_THROUGH_RE = re.compile(r'^\s*"?(F_TRANSLUCENT|F_ALPHA_TEST|F_BLEND_MODE|F_ADDITIVE_BLEND)"?\s+"?[1-9]', re.M)
 _SEE_SHADER_RE = re.compile(r'^\s*"?shader"?\s+"(csgo_glass|csgo_refract|csgo_water\w*|tools_wireframe)\.vfx"',
                             re.M | re.I)
 

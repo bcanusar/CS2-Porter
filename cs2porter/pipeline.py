@@ -30,7 +30,7 @@ from . import materials as materialsmod
 from .materials import (BLACK_MATERIALS, BROKEN_CABLE_MATERIALS, MaterialConverter, out_name,
                         write_black_material, write_cable_fallback)
 from .models import ModelConverter, QCIndex, norm_model
-from .skybox import MOONDOME_VMAT, SKY_VMAT, build_skybox, suns_of
+from .skybox import build_skybox, sky_paths, suns_of
 from .sources import AssetSources, CS2Index, DirSource, VPKSource
 from .vpk import VPKArchive, VPKError
 from .valve_tools import Cancelled, ToolError, ValveTools, decompile_bsp
@@ -574,21 +574,34 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
         ctx.log(t("p_tools_skipped", n=len(tools_skipped)), "dim")
 
 
-def make_skybox(cfg, ctx, report, sources, content_dir, skyname, suns=None, sky_angles=None):
-    """Builds skybox.png / skybox.vmat (and skybox_moondome.vmat when the sky brushes use it).
-    True if they can be used."""
+def make_skybox(cfg, ctx, report, sources, content_dir, skyname, suns=None, sky_angles=None, paths=None):
+    """Builds skybox.png / skybox.vmat (and skybox_moondome.vmat when the sky brushes use it),
+    or the names in paths (sky_paths). True if they can be used."""
     ctx.check()
+    paths = paths or sky_paths()
     st, detail = build_skybox(sources, content_dir, skyname, config.VTFCMD,
                               cfg["opts"].get("overwrite", False), ctx.log,
                               moondome=bool(cfg["opts"].get("sky_moondome", True)), suns=suns,
-                              sky_angles=sky_angles)
+                              sky_angles=sky_angles, paths=paths)
     report.skybox = f"{skyname}: {t_en('st_' + st)} ({detail})"
-    ctx.result("skybox", SKY_VMAT, st, detail, "")
+    ctx.result("skybox", paths[0], st, detail, "")
     ctx.log(t("p_skybox", sky=skyname, status=status_text(st), detail=detail),
             "ok" if st == "created" else ("warn" if st == "missing" else "dim"))
     if st == "created":
-        report.created_files.append(os.path.join(content_dir, *SKY_VMAT.split("/")))
+        report.created_files.append(os.path.join(content_dir, *paths[0].split("/")))
     return st in ("created", "exists")
+
+
+def map_sky_paths(content_dir, map_name):
+    """The sky files of a map: skybox.vmat ... when it is the only map of the addon, else
+    skybox_<map>.vmat ... so the maps do not draw each other's sky."""
+    try:
+        names = os.listdir(os.path.join(content_dir, "maps"))
+    except OSError:
+        names = []
+    own = {f"{map_name}.vmap".lower(), f"{map_name}{sky3dmod.SKY_SUFFIX}.vmap".lower()}
+    others = [n for n in names if n.lower().endswith(".vmap") and n.lower() not in own]
+    return sky_paths(map_name if others else "")
 
 
 def make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients=(), map_name="", report=None):
@@ -747,6 +760,7 @@ ENTITY_TEMPLATES = {"spark": "spark_template.vpcf", "smokestack": "smokestack_te
                     "tesla": "tesla_template.vpcf"}
 # a smokestack whose material has no texture to show draws Source 1's usual smoke
 SMOKE_TEXTURE = "materials/particle/vistasmokev1/vistasmokev1_emods.vtex"
+SMOKE_SHEET_ALPHA = 0.7
 TESLA_TEXTURE = "materials/sprites/physbeam.vtex"
 
 
@@ -880,10 +894,21 @@ def generated_particle(params, texture=None):
         vals["max_particles"] = str(int(params["count"]) + 8)
     else:
         vals["max_particles"] = str(min(int(params["rate"] * params["life_max"] * 1.25) + 16, 10000))
+    tex = None
     if smoke:
         vals.update(_smoke_blocks(params))
         vals["self_illum"] = "0.3"
-    return tmpl.substitute(vals)
+        tex = texture(params["_material"])[0] if texture and params.get("_material") else None
+        if params.get("_material") and not tex:
+            # CS2's smoke sheet is much thicker than Source 1's soft smoke puff
+            vals["alpha"] = _num_text(float(params["alpha"]) * SMOKE_SHEET_ALPHA)
+    text = tmpl.substitute(vals)
+    if tex:
+        # func_smokevolume draws its own material (a round puff, see-through in its alpha)
+        text = text.replace(f'm_hTexture = resource:"{SMOKE_TEXTURE}"\n'
+                            '\t\t\t\t\tm_nTextureChannels = "SPRITECARD_TEXTURE_CHANNEL_MIX_A"',
+                            f'm_hTexture = resource:"{tex}"', 1)
+    return text
 
 
 def write_particles(ctx, content_dir, kinds, overwrite=False, generated=None, texture=None):
@@ -996,8 +1021,8 @@ def particle_textures(cfg, sources, report, content_dir):
 
 
 def write_glow_particles(ctx, content_dir, glows):
-    """glows: {vpcf: 'materials/x.tga'}: copies of glow_particle.vpcf that draw the sprite's own
-    texture (a .vtex is written next to the texture)."""
+    """glows: {vpcf: 'materials/x.tga'}: copies of glow_particle.vpcf that draw the sprite's
+    own texture (a .vtex is written next to the texture)."""
     if not glows:
         return
     try:
@@ -1006,13 +1031,13 @@ def write_glow_particles(ctx, content_dir, glows):
     except OSError:
         return
     for rel, tex in sorted(glows.items()):
-        vtex = tex.rsplit(".", 1)[0] + ".vtex"
         try:
+            dst = os.path.join(content_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            vtex = tex.rsplit(".", 1)[0] + ".vtex"
             vtex_abs = os.path.join(content_dir, *vtex.split("/"))
             with open(vtex_abs, "w", encoding="utf-8", newline="\n") as f:
                 f.write(particlesmod.VTEX_TEMPLATE.replace("$FILE", tex))
-            dst = os.path.join(content_dir, *rel.split("/"))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
             text = re.sub(r'm_hTexture = resource:"[^"]*"', f'm_hTexture = resource:"{vtex}"', base)
             # a Source 1 sprite is as many units wide as its texture has pixels (times its scale)
             tex_abs = os.path.join(content_dir, *tex.split("/"))
@@ -1025,6 +1050,31 @@ def write_glow_particles(ctx, content_dir, glows):
                 text = text.replace("\t\t\tm_bSaturateColorPreAlphaBlend = false",
                                     '\t\t\tm_nOutputBlendMode = "PARTICLE_OUTPUT_BLEND_MODE_ADD"\n'
                                     "\t\t\tm_bSaturateColorPreAlphaBlend = false", 1)
+            with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            ctx.log(t("p_particle", f=rel), "ok")
+        except OSError as e:
+            ctx.log(t("snd_fail", f=rel, e=e), "err")
+
+
+def write_beam_particles(ctx, content_dir, beams, texture):
+    """beams: {vpcf: beam material}: copies of beam_particle.vpcf that draw the beam material's
+    own texture (texture: see particle_textures). The bundled particle draws lit with a strong
+    self add (as a laser made by hand in CS2 that shows in game; the unlit additive version did
+    not show); a material without a texture keeps its laser texture."""
+    if not beams:
+        return
+    try:
+        with open(os.path.join(config.ASSETS_DIR, "beam_particle.vpcf"), "r", encoding="utf-8") as f:
+            base = f.read()
+    except OSError:
+        return
+    for rel, mat in sorted(beams.items()):
+        tex = texture(mat)[0] if texture else None
+        text = re.sub(r'm_hTexture = resource:"[^"]*"', f'm_hTexture = resource:"{tex}"', base) if tex else base
+        dst = os.path.join(content_dir, *rel.split("/"))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(dst, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             ctx.log(t("p_particle", f=rel), "ok")
@@ -1361,6 +1411,25 @@ def _mip_fades(ctx, sources, vinfo, vmf_path, meshes):
     ctx.log(t("p_mip_fade", mats=", ".join(sorted(fades)), n=faces, k=tiles), "info")
 
 
+def _touching_faces(ctx, sources, vinfo, vmf_path):
+    """See-through brush faces that lie fully on another see-through brush face become nodraw
+    (vmf.hide_touching_faces), so the place is drawn once like in Source 1."""
+    mats = {mat for mat, uses in vinfo.materials.items()
+            if uses & {"brush", "brushent"} and materialsmod.blends_behind(sources, mat)}
+    if not mats:
+        return
+    try:
+        root = vmfmod.parse_vmf(vmf_path)
+        n = vmfmod.hide_touching_faces(root, mats)
+        if n:
+            vmfmod.write_vmf(root, vmf_path)
+    except Exception as e:  # noqa: BLE001 - the faces stay as they are
+        ctx.log(t("p_touch_fail", e=e), "warn")
+        return
+    if n:
+        ctx.log(t("p_touch", n=n), "info")
+
+
 def _light_setup(ctx, opts, root, info, tracer):
     """Lights for the .vmap fixes, the bounds of the map (for the visibility_hint) and the light
     probe volumes with their rooms. info: the .bsp (None for a .vmf input)."""
@@ -1634,6 +1703,7 @@ def port_map(cfg, ctx, input_path, addon_name):
     try:
         if opts.get("mip_fade", True):
             _mip_fades(ctx, sources, vinfo, vmf_path, meshes)
+        _touching_faces(ctx, sources, vinfo, vmf_path)
         ctx.check()
         # --- 3) map geometry (import) ---------------------------------------
         ctx.progress(0.2, t("pr_import"))
@@ -1650,8 +1720,9 @@ def port_map(cfg, ctx, input_path, addon_name):
         # the sun goes where the imported map's env_sky shows its direction
         sky_angles = vmapmod.env_sky_angles(os.path.join(cfg["cs2_dir"], "content", "csgo_addons", addon, "maps",
                                                          f"{map_name}.vmap")) if suns else None
+        sky_files = map_sky_paths(content_dir, map_name)
         sky_ok = make_skybox(cfg, ctx, report, sources, content_dir, vinfo.skyname, suns,
-                             sky_angles) if vinfo.skyname else False
+                             sky_angles, sky_files) if vinfo.skyname else False
         bsp_name = os.path.splitext(os.path.basename(input_path))[0]
         ambient_table = make_sounds(cfg, ctx, sources, content_dir, ent_sounds, bsp_name, ambients, map_name, report)
         particle_names = make_particles(cfg, ctx, valve if cs2_ok else None, sources, work, content_dir,
@@ -1710,8 +1781,8 @@ def port_map(cfg, ctx, input_path, addon_name):
             water_set = water_vmats(sources, materials)
             underwater = _underwater(ctx, opts, content_dir, water_set)
             surface_lights = _surface_lights(ctx, sources, glow_rects, tex_lights)
-            fx = vmapmod.Fixes(sky_alias=sky_alias, sky_vmat=SKY_VMAT if sky_ok else None,
-                               moondome_vmat=MOONDOME_VMAT if sky_ok and opts.get("sky_moondome", True) else None, lights=lights,
+            fx = vmapmod.Fixes(sky_alias=sky_alias, sky_vmat=sky_files[0] if sky_ok else None,
+                               moondome_vmat=sky_files[1] if sky_ok and opts.get("sky_moondome", True) else None, lights=lights,
                                lumens=bool(opts.get("fix_light_brightness", True)),
                                bhop=bhop_on, attributes=attributes, meshes=meshes,
                                blends=blendmod.only_blends(disps, sources) if disps else None,
@@ -1727,6 +1798,8 @@ def port_map(cfg, ctx, input_path, addon_name):
             if sky3d and sky3d.imported:
                 _sky3d_vmap(ctx, valve, work, maps_dir, sources, fx, res, sky3d, tex_lights)
             write_glow_particles(ctx, content_dir, fx.glow_particles)
+            textures = particle_textures(cfg, sources, report, content_dir)
+            write_beam_particles(ctx, content_dir, fx.beam_particles, textures)
             if res.stats.get("black"):
                 # black faces (also the ones the import itself gives a black material)
                 write_black_material(content_dir)
@@ -1739,8 +1812,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             if res.stats.get("effects"):
                 kinds |= set(effects.get("kinds") or {})
             write_particles(ctx, content_dir, kinds, opts.get("overwrite", False),
-                            effects.get("generated") if res.stats.get("effects") else None,
-                            particle_textures(cfg, sources, report, content_dir))
+                            effects.get("generated") if res.stats.get("effects") else None, textures)
             _beam_notice(report, res.stats)
         moved = vmapmod.move_postprocess(content_dir, overwrite=created or opts.get("overwrite", False)) \
             if cs2_ok else 0
@@ -1984,6 +2056,8 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
 _VMAP_REF_RE = re.compile(rb"((?:materials|models)/[A-Za-z0-9_\-./ +()]+?\.(?:vmat|vmdl))")
 _SKY_FACE_RE = re.compile(r"^skybox/(.+?)(?:_hdr)?(?:up|dn|lf|rt|ft|bk)$")
 _OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_moondome", "cs2porter/black", "cs2porter/cable_black")
+# the sky of a map that shares its addon (map_sky_paths): skybox_<map>, skybox_moondome_<map>
+_OWN_SKY_RE = re.compile(r"^skybox/skybox(?:_moondome)?_(\w+)$")
 
 
 def read_vmap_refs(path):
@@ -2012,6 +2086,18 @@ def _sky_from_refs(mats):
             names[m.group(1)] = names.get(m.group(1), 0) + 1
             del mats[k]
     return max(names, key=names.get) if names else ""
+
+
+def _own_sky_paths(mats):
+    """The sky files a map ported by the program uses (skybox_<map>.vmat when it shares its
+    addon, see map_sky_paths); they are taken out of mats, since the skybox step makes them."""
+    owner = ""
+    for k in list(mats):
+        m = _OWN_SKY_RE.match(k)
+        if m:
+            owner = m.group(1)
+            del mats[k]
+    return sky_paths(owner)
 
 
 FIND_LIMIT = 2000
@@ -2404,6 +2490,8 @@ def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=
     else:
         mats, mdls = parse_reference_text(source.get("text", ""))
         ctx.log(t("p_ref_text", mats=len(mats), mdls=len(mdls)), "info")
+    # first: skybox_<map>.vmat of a map named like ..._warmup would look like a sky face
+    sky_files = _own_sky_paths(mats)
     skyname = _sky_from_refs(mats)
     if only is not None:
         mats = {m: mats.get(m, {"ref"}) for m in only[0]}
@@ -2455,7 +2543,7 @@ def complete_missing(cfg, ctx, source, addon_name=None, out_dir=None, extra_dir=
     try:
         # writing into an addon also makes the skybox, like a port does
         if game_dir and skyname:
-            make_skybox(cfg, ctx, report, sources, content_dir, skyname)
+            make_skybox(cfg, ctx, report, sources, content_dir, skyname, paths=sky_files)
         elif game_dir:
             ctx.log(t("p_sky_unknown"), "dim")
         tex_lights = None
