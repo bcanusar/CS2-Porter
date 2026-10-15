@@ -91,8 +91,8 @@ DEFAULTS = {
         "light_probes": True,
         "port_particles": True,
         "post_processing": True,
-        # sky brushes get skybox_moondome.vmat (off: they stay tools/toolsskybox.vmat)
-        "sky_moondome": True,
+        # sky brushes get skybox_occluder.vmat (off: they stay tools/toolsskybox.vmat)
+        "sky_occluder": True,
         # a model material found nowhere is replaced by a CS2 material, so the model compiles
         "model_placeholder": True,
         # env_sun is drawn into the sky texture and left out of the CS2 map
@@ -121,10 +121,18 @@ def _vpks(d, names):
             if n.lower().endswith(".vpk") and not _VPK_PART_RE.search(n) and os.path.isfile(os.path.join(d, n))]
 
 
+def _bsps(d, names):
+    # maps: the files packed in them fill in what nothing else has (a map the same author made
+    # often packs what another one left out)
+    return [os.path.join(d, n) for n in sorted(names)
+            if n.lower().endswith(".bsp") and os.path.isfile(os.path.join(d, n))]
+
+
 def resource_entries(folders, depth=3):
     """What the resource folders hold, as a Source 1 game would mount it: ("dir", root) for every
-    game-like folder (it holds materials/, models/, sound/ ...) and ("vpk", path) for every
-    package, also a few levels down: 'Resources' finds 'Resources/Games/Counter-Strike Source'.
+    game-like folder (it holds materials/, models/, sound/ ...), ("vpk", path) for every
+    package and ("bsp", path) for every map (also in maps/ of a game-like folder), also a few
+    levels down: 'Resources' finds 'Resources/Games/Counter-Strike Source'.
     A picked materials/ (or models/ ...) folder stands for the folder above it."""
     out = []
 
@@ -137,8 +145,16 @@ def resource_entries(folders, depth=3):
         if any(s in low for s in RESOURCE_SUBDIRS):
             out.append(("dir", d))
             out.extend(("vpk", v) for v in _vpks(d, names))
+            out.extend(("bsp", b) for b in _bsps(d, names))
+            maps = next((os.path.join(d, n) for n in names if n.lower() == "maps"), None)
+            if maps and os.path.isdir(maps):
+                try:
+                    out.extend(("bsp", b) for b in _bsps(maps, os.listdir(maps)))
+                except OSError:
+                    pass
             return
         out.extend(("vpk", v) for v in _vpks(d, names))
+        out.extend(("bsp", b) for b in _bsps(d, names))
         if level >= depth:
             return
         for n in sorted(names):

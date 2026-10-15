@@ -4,7 +4,7 @@ The importer splits the map into a main .vmap (text) and prefab .vmap files (bin
 Binary files are turned into text with CS2's dmxconvert, edited, then the prefabs are
 collapsed into the main map (like Hammer's "Collapse All Prefabs") and it is saved as binary.
 
-- the stand-in sky material becomes skybox_moondome.vmat (with clip collision) or
+- the stand-in sky material becomes skybox_occluder.vmat (clip collision, no shadows) or
   tools/toolsskybox when there is no skybox; env_sky gets skybox.vmat
 - lights get brightness_lumens and range worked out from the original light (see lighting.py),
   default indirect light and falloff; light_environment gets sensible brightness /
@@ -49,7 +49,7 @@ STRIP_KEY = "cs2porter_strip"
 
 
 class Fixes:
-    def __init__(self, sky_alias=None, sky_vmat=None, moondome_vmat=None, lights=None, lumens=True,
+    def __init__(self, sky_alias=None, sky_vmat=None, occluder_vmat=None, lights=None, lumens=True,
                  bhop=False, attributes=None, meshes=None, blends=None, fgd=None, collapse=True,
                  ropes=None, ambients=None, water=None, commands=False, uv_sizes=None,
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
@@ -57,7 +57,7 @@ class Fixes:
                  skybox_ref=None, sky_map=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
-        self.moondome_vmat = moondome_vmat  # material for the sky brushes (None: tools/toolsskybox)
+        self.occluder_vmat = occluder_vmat  # material for the sky brushes (None: tools/toolsskybox)
         self.lights = lights or []          # [(cs2_class, (x, y, z), info)] from vmf.collect_lights
         self.lumens = lumens                # write brightness_lumens
         self.bhop = bhop
@@ -244,7 +244,8 @@ def replace_sky(text, alias, new_vmat):
 
 
 def clip_meshes(text, vmat):
-    """Sets physicsCollisionProperty to clip on every mesh that uses vmat."""
+    """Sets physicsCollisionProperty to clip on every mesh that uses vmat, and turns its shadows
+    off (the sky occluder casts shadows like a wall, the other faces of a sky brush too)."""
     lines = text.split("\n")
     in_mats = flagged = False
     count = 0
@@ -259,7 +260,10 @@ def clip_meshes(text, vmat):
             elif vmat in s:
                 flagged = True
             continue
-        if flagged and s.startswith('"physicsCollisionProperty" "string"'):
+        if flagged and s.startswith('"disableShadows" "int"'):
+            indent = line[:len(line) - len(line.lstrip())]
+            lines[i] = f'{indent}"disableShadows" "int" "1"'
+        elif flagged and s.startswith('"physicsCollisionProperty" "string"'):
             indent = line[:len(line) - len(line.lstrip())]
             lines[i] = f'{indent}"physicsCollisionProperty" "string" "clip"'
             flagged = False
@@ -1138,10 +1142,10 @@ def set_particle_names(text, names):
 
 def _edit_text(text, fx, table, stats):
     if fx.sky_alias:
-        text, n = replace_sky(text, fx.sky_alias, fx.moondome_vmat or TOOLS_SKY_VMAT)
+        text, n = replace_sky(text, fx.sky_alias, fx.occluder_vmat or TOOLS_SKY_VMAT)
         stats["sky"] += n
-    if fx.moondome_vmat and fx.moondome_vmat in text:
-        text, n = clip_meshes(text, fx.moondome_vmat)
+    if fx.occluder_vmat and fx.occluder_vmat in text:
+        text, n = clip_meshes(text, fx.occluder_vmat)
         stats["clip"] += n
     if fx.sky_vmat and "env_sky" in text:
         text, n = set_env_sky(text, fx.sky_vmat)
@@ -1225,7 +1229,7 @@ def _paint(text, fx, stats):
         from . import uvfix
         try:
             text = uvfix.fix_texture_scales(text, fx.uv_sizes, stats,
-                                            {fx.moondome_vmat: SKY_FACE_SCALE} if fx.moondome_vmat else None)
+                                            {fx.occluder_vmat: SKY_FACE_SCALE} if fx.occluder_vmat else None)
         except (ValueError, IndexError, KeyError) as e:
             stats.setdefault("errors", []).append(f"uv: {e}")
         try:
@@ -1446,7 +1450,7 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
 
     # --- log --------------------------------------------------------------------------
     if stats["sky"]:
-        log(t("vm_moondome", n=stats["clip"]) if fx.moondome_vmat else t("vm_sky", n=stats["sky"]), "ok")
+        log(t("vm_occluder", n=stats["clip"]) if fx.occluder_vmat else t("vm_sky", n=stats["sky"]), "ok")
     if stats["envsky"]:
         log(t("vm_envsky", vmat=fx.sky_vmat), "ok")
     if stats["lights"]:

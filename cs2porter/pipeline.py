@@ -575,13 +575,13 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
 
 
 def make_skybox(cfg, ctx, report, sources, content_dir, skyname, suns=None, sky_angles=None, paths=None):
-    """Builds skybox.png / skybox.vmat (and skybox_moondome.vmat when the sky brushes use it),
+    """Builds skybox.png / skybox.vmat (and skybox_occluder.vmat when the sky brushes use it),
     or the names in paths (sky_paths). True if they can be used."""
     ctx.check()
     paths = paths or sky_paths()
     st, detail = build_skybox(sources, content_dir, skyname, config.VTFCMD,
                               cfg["opts"].get("overwrite", False), ctx.log,
-                              moondome=bool(cfg["opts"].get("sky_moondome", True)), suns=suns,
+                              occluder=bool(cfg["opts"].get("sky_occluder", True)), suns=suns,
                               sky_angles=sky_angles, paths=paths)
     report.skybox = f"{skyname}: {t_en('st_' + st)} ({detail})"
     ctx.result("skybox", paths[0], st, detail, "")
@@ -1643,7 +1643,7 @@ def port_map(cfg, ctx, input_path, addon_name):
     if sky3d:
         sky3d.lights = _lights_of(ctx, opts, sky3d.root, info, tracer)
     if light_rooms and sky_alias:
-        # the white rooms are wrapped in sky brushes (moondome) so they look like the sky
+        # the white rooms are wrapped in sky brushes (occluder) so they look like the sky
         shells = vmfmod.add_room_shells(root, light_rooms, probesmod.ROOM_HALF, vmfmod.SKYBOX_MAT)
         if shells:
             ctx.detail(t("d_room_shells", n=shells))
@@ -1782,7 +1782,7 @@ def port_map(cfg, ctx, input_path, addon_name):
             underwater = _underwater(ctx, opts, content_dir, water_set)
             surface_lights = _surface_lights(ctx, sources, glow_rects, tex_lights)
             fx = vmapmod.Fixes(sky_alias=sky_alias, sky_vmat=sky_files[0] if sky_ok else None,
-                               moondome_vmat=sky_files[1] if sky_ok and opts.get("sky_moondome", True) else None, lights=lights,
+                               occluder_vmat=sky_files[1] if sky_ok and opts.get("sky_occluder", True) else None, lights=lights,
                                lumens=bool(opts.get("fix_light_brightness", True)),
                                bhop=bhop_on, attributes=attributes, meshes=meshes,
                                blends=blendmod.only_blends(disps, sources) if disps else None,
@@ -2055,9 +2055,12 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
 
 _VMAP_REF_RE = re.compile(rb"((?:materials|models)/[A-Za-z0-9_\-./ +()]+?\.(?:vmat|vmdl))")
 _SKY_FACE_RE = re.compile(r"^skybox/(.+?)(?:_hdr)?(?:up|dn|lf|rt|ft|bk)$")
-_OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_moondome", "cs2porter/black", "cs2porter/cable_black")
-# the sky of a map that shares its addon (map_sky_paths): skybox_<map>, skybox_moondome_<map>
-_OWN_SKY_RE = re.compile(r"^skybox/skybox(?:_moondome)?_(\w+)$")
+# skybox_moondome: the sky brushes of maps ported by older versions
+_OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_occluder", "skybox/skybox_moondome", "cs2porter/black",
+                  "cs2porter/cable_black")
+# the sky of a map that shares its addon (map_sky_paths): skybox_<map> (older versions:
+# skybox_moondome_<map> too)
+_OWN_SKY_RE = re.compile(r"^skybox/skybox(?:_moondome)?_(?!(?:occluder|moondome)$)(\w+)$")
 
 
 def read_vmap_refs(path):

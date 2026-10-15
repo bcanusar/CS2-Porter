@@ -3,6 +3,7 @@
 
 import glob
 import os
+import threading
 
 from . import kv
 from .i18n import t
@@ -139,6 +140,69 @@ class VPKSource:
             self._arc.close()
 
 
+class _BSPPak:
+    """The packed files of a .bsp, read like a package (entries / read / close). Only the
+    names are kept; the pakfile itself is held for the few maps read last (they can be big)."""
+
+    MAX_OPEN = 3
+    _names = {}             # (path, size, mtime) -> {game path: name in the pakfile}, per process
+    _open = []              # [(path, PakZip)], most recently read last
+    _lock = threading.Lock()
+
+    def __init__(self, path):
+        self.path = path
+        st = os.stat(path)
+        key = (os.path.normcase(path), st.st_size, st.st_mtime)
+        with self._lock:
+            names = self._names.get(key)
+        if names is None:
+            zf = self._pak()
+            names = {_norm(z.filename): z.filename for z in zf.infolist() if not z.is_dir()} if zf else {}
+            with self._lock:
+                self._names[key] = names
+        self.entries = names
+
+    def _pak(self):
+        with self._lock:
+            for i, (p, zf) in enumerate(self._open):
+                if p == self.path:
+                    self._open.append(self._open.pop(i))
+                    return zf
+        from .bsp import BSPInfo
+        zf = BSPInfo(self.path).pakfile()
+        with self._lock:
+            self._open.append((self.path, zf))
+            del self._open[:-self.MAX_OPEN]
+        return zf
+
+    def read(self, rel):
+        zf = self._pak()
+        return zf.read(self.entries[_norm(rel)])
+
+    def close(self):
+        pass
+
+
+class BSPPakSource(VPKSource):
+    """The packed files of a map in a resource folder. Searched after the installed games, so
+    it only fills in files nothing else has."""
+
+    @property
+    def arc(self):
+        if self._arc is None:
+            try:
+                self._arc = _BSPPak(self.dir_path)
+            except Exception as e:  # noqa: BLE001 - a broken map is a package without files
+                raise VPKError(str(e)) from e
+        return self._arc
+
+    def has(self, rel):
+        try:
+            return _norm(rel) in self.arc.entries
+        except VPKError:
+            return False
+
+
 # ---------------------------------------------------------------------------
 # gameinfo.txt search paths
 # ---------------------------------------------------------------------------
@@ -212,19 +276,24 @@ def _is_sound_vpk(path):
 # ---------------------------------------------------------------------------
 
 class AssetSources:
-    """Search order: extra folders, embedded files, resource folders, installed games, and last
-    every other file of the extra folders (loose_dirs, matched by file name)."""
+    """Search order: extra folders, embedded files, resource folders, installed games, the maps
+    (.bsp) of the extra and resource folders, and last every other file of the extra folders
+    (loose_dirs, matched by file name)."""
 
     def __init__(self, embedded_dir=None, resource_dirs=(), gamedirs=(), log=None, extra_dirs=(),
                  loose_dirs=()):
         self.sources = []
         self.sound_sources = []     # sound VPKs, only opened when a sound is looked up
         self.log = log
+        maps = []                   # maps of the extra and resource folders, searched after the games
         # extra folders: (kind, path) entries like the resource folders, or plain folders
         for r in extra_dirs:
             kind, d = r if isinstance(r, tuple) else ("dir", r)
             label = t("src_extra", name=os.path.basename(os.path.normpath(d)))
-            if kind == "dir" and d and os.path.isdir(d):
+            if kind == "bsp" and os.path.isfile(d):
+                # not "extra": a model in another map is no version of this map's own
+                maps.append(BSPPakSource(d, label, role="resources"))
+            elif kind == "dir" and d and os.path.isdir(d):
                 self.sources.append(DirSource(d, label, role="extra"))
             elif kind == "vpk" and os.path.isfile(d):
                 try:
@@ -240,7 +309,9 @@ class AssetSources:
         for r in resource_dirs:
             kind, p = r if isinstance(r, tuple) else ("dir", r)
             label = t("src_resources", name=os.path.basename(os.path.normpath(p)))
-            if kind == "dir" and os.path.isdir(p):
+            if kind == "bsp" and os.path.isfile(p):
+                maps.append(BSPPakSource(p, label, role="resources"))
+            elif kind == "dir" and os.path.isdir(p):
                 self.sources.append(DirSource(p, label, role="resources"))
             elif kind == "vpk" and os.path.isfile(p):
                 try:
@@ -278,6 +349,7 @@ class AssetSources:
                     src = DirSource(p, t("src_game_dir", game=game, name=os.path.basename(p)))
                     src.game = game
                     self.sources.append(src)
+        self.sources += maps
         # loose_dirs: folders or (folder, label) whose files also count by their name
         for d in loose_dirs:
             d, label = d if isinstance(d, tuple) else (d, None)

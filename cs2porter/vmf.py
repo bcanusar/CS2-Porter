@@ -799,34 +799,6 @@ def pick_sky_alias(materials):
     return name
 
 
-NODRAW_MAT = "tools/toolsnodraw"
-
-
-def _sky_brush_nodraw(root):
-    """A brush with a sky face often has toolsnodraw on its other faces. In Source 1 the light
-    that reaches the sky face counts as sky light; in CS2 the sky face lets it through and the
-    nodraw faces behind it cast shadows, so the room under it gets no sun or sky light. Those
-    nodraw faces (never seen) become sky faces too. Returns the number of faces changed."""
-    count = 0
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        for ch in node.children():
-            if ch.name.lower() != "solid":
-                stack.append(ch)
-                continue
-            sides = list(ch.children("side"))
-            mats = [normalize_material(s.get("material", "")) for s in sides]
-            sky = next((m for m in mats if m in SKYBOX_MATS), None)
-            if sky is None:
-                continue
-            for s, m in zip(sides, mats):
-                if m == NODRAW_MAT and s.child("dispinfo") is None:
-                    s.set("material", sky)
-                    count += 1
-    return count
-
-
 def _swap_sky_material(root, alias, mats=SKYBOX_MATS):
     count = 0
     stack = [root]
@@ -2875,7 +2847,6 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["spawns"] = _fill_spawns(root)
     stats["nonsolid"] = _nonsolid_disps(root)
     if sky_alias:
-        stats["sky_nodraw"] = _sky_brush_nodraw(root)
         stats["skybox"] = _swap_sky_material(root, sky_alias)
     stats["ladders"] = _ladders_to_world(root)
     stats["trigger_clip"] = _world_triggers_to_clip(root)
@@ -2962,7 +2933,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks", "weaponstrip", "sky_nodraw", "beam_sparks"):
+                  "landmarks", "weaponstrip", "beam_sparks"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

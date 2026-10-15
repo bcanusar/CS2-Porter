@@ -117,10 +117,23 @@ def _same(a, b):
 
 
 # ---------------------------------------------------------------------------
-# Adding files: folders are searched, archives (.zip, .rar, .7z) are unpacked into the work folder
+# Adding files: folders are searched, archives (.zip, .rar, .7z, .bz2) are unpacked into the work
+# folder
 # ---------------------------------------------------------------------------
 
-ARCHIVE_EXTS = (".zip", ".rar", ".7z")
+ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".bz2")
+
+
+def _unpack_bz2(path, dest):
+    """x.bsp.bz2 (how servers hand out their files) holds one file: x.bsp. A .tar.bz2 holds a
+    folder, tar unpacks that."""
+    if path.lower().endswith(".tar.bz2"):
+        _unpack_other(path, dest)
+        return
+    import bz2
+    out = os.path.join(dest, os.path.basename(path)[:-4] or "file")
+    with bz2.open(path, "rb") as src, open(out, "wb") as dst:
+        shutil.copyfileobj(src, dst, 1 << 20)
 ARCHIVE_PATTERN = " ".join("*" + e for e in ARCHIVE_EXTS)
 
 
@@ -167,6 +180,8 @@ def _zip_dir(path):
             if path.lower().endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     zf.extractall(part)
+            elif path.lower().endswith(".bz2"):
+                _unpack_bz2(path, part)
             else:
                 _unpack_other(path, part)
         except BaseException:
@@ -203,7 +218,7 @@ def expand_paths(paths, exts, log=None):
     def unzip(z, shown):
         try:
             walk(_zip_dir(z), shown)
-        except (OSError, zipfile.BadZipFile, RuntimeError, ValueError) as e:
+        except (OSError, EOFError, zipfile.BadZipFile, RuntimeError, ValueError) as e:
             if log:
                 log(t("tl_zip_fail", f=os.path.basename(z), e=e), "warn")
 
@@ -511,7 +526,7 @@ _SKY_FACE_RE = re.compile(r"^(.+?)_?(up|dn|lf|rt|ft|bk)$", re.I)
 
 def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
     """Six skybox faces (<name>up / dn / lf / rt / ft / bk, any image format) -> a CS2 cube
-    cross (skybox.png) with skybox.vmat and skybox_moondome.vmat, one folder per sky."""
+    cross (skybox.png) with skybox.vmat and skybox_occluder.vmat, one folder per sky."""
     from . import skybox as skymod
     ok = skip = fail = 0
     for it in items:
@@ -531,8 +546,8 @@ def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
             skymod.compose(imgs, ring, up_rot, dn_rot).save(png, "PNG")
             with open(os.path.join(dst, "skybox.vmat"), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(skymod.SKY_TEMPLATE % {"png": skymod.SKY_PNG})
-            with open(os.path.join(dst, "skybox_moondome.vmat"), "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(skymod.MOONDOME_TEMPLATE % {"png": skymod.SKY_PNG})
+            with open(os.path.join(dst, "skybox_occluder.vmat"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(skymod.OCCLUDER_TEMPLATE)
             ok += 1
             fit = t("sk_fit", order=" ".join(ring), up=up_rot * 90, dn=dn_rot * 90).strip()
             log(f"  OK  {name}  {fit}", "info")
@@ -553,7 +568,7 @@ CUBE_BIG = 2048
 
 def run_sky_cube(faces, name, out, opts, log):
     """Images the user put on the open cube ({face: path}) -> the same CS2 sky as from Source 1
-    faces (skybox.png, skybox.vmat, skybox_moondome.vmat in out/name). Every image is stretched to
+    faces (skybox.png, skybox.vmat, skybox_occluder.vmat in out/name). Every image is stretched to
     the square face size (nothing is cut off): 2048 when every image is at least that big, else
     1024. A face without an image (or with one that cannot be read) is black. Returns the
     folder, or None."""
@@ -581,8 +596,8 @@ def run_sky_cube(faces, name, out, opts, log):
     skymod.compose(full, CUBE_RING, 0, 0, size).save(png, "PNG")
     with open(os.path.join(dst, "skybox.vmat"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(skymod.SKY_TEMPLATE % {"png": skymod.SKY_PNG})
-    with open(os.path.join(dst, "skybox_moondome.vmat"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(skymod.MOONDOME_TEMPLATE % {"png": skymod.SKY_PNG})
+    with open(os.path.join(dst, "skybox_occluder.vmat"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(skymod.OCCLUDER_TEMPLATE)
     log(t("sb_done", f=dst, n=len(imgs), size=size), "ok")
     if missing:
         log(t("sb_empty_faces", list=", ".join(t("sb_face_" + f) for f in missing)), "info")

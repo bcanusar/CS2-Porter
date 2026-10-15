@@ -3126,7 +3126,7 @@ class App:
         right.columnconfigure(1, weight=1, uniform="look")
         self.opt_vars = {}
         tips = {"light_probes": "opt_light_probes_tip", "post_processing": "opt_post_processing_tip",
-                "bhop_blocks": "opt_bhop_blocks_tip", "sky_moondome": "opt_sky_moondome_tip", "sun_in_sky": "opt_sun_in_sky_tip", "sky3d": "opt_sky3d_tip",
+                "bhop_blocks": "opt_bhop_blocks_tip", "sky_occluder": "opt_sky_occluder_tip", "sun_in_sky": "opt_sun_in_sky_tip", "sky3d": "opt_sky3d_tip",
                 "model_placeholder": "opt_model_placeholder_tip", "mip_fade": "opt_mip_fade_tip"}
 
         def add_opt(parent, key, label, pad=0):
@@ -3167,7 +3167,7 @@ class App:
                                      ("light_probes", "opt_light_probes"), ("port_particles", "opt_port_particles"),
                                      ("post_processing", "opt_post_processing"),
                                      ("model_placeholder", "opt_model_placeholder"))),
-                          (cols[1], (("sky_moondome", "opt_sky_moondome"), ("sun_in_sky", "opt_sun_in_sky"),
+                          (cols[1], (("sky_occluder", "opt_sky_occluder"), ("sun_in_sky", "opt_sun_in_sky"),
                                      ("sky3d", "opt_sky3d"), ("mip_fade", "opt_mip_fade")))):
             for key, label in opts:
                 add_opt(col, key, label)
