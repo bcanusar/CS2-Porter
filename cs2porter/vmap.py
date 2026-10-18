@@ -4,7 +4,7 @@ The importer splits the map into a main .vmap (text) and prefab .vmap files (bin
 Binary files are turned into text with CS2's dmxconvert, edited, then the prefabs are
 collapsed into the main map (like Hammer's "Collapse All Prefabs") and it is saved as binary.
 
-- the stand-in sky material becomes skybox_occluder.vmat (clip collision, no shadows) or
+- the stand-in sky material becomes tools/toolsskybox_occluder.vmat (clip collision, no shadows) or
   tools/toolsskybox when there is no skybox; env_sky gets skybox.vmat
 - lights get brightness_lumens and range worked out from the original light (see lighting.py),
   default indirect light and falloff; light_environment gets sensible brightness /

@@ -575,13 +575,12 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
 
 
 def make_skybox(cfg, ctx, report, sources, content_dir, skyname, suns=None, sky_angles=None, paths=None):
-    """Builds skybox.png / skybox.vmat (and skybox_occluder.vmat when the sky brushes use it),
-    or the names in paths (sky_paths). True if they can be used."""
+    """Builds skybox.png / skybox.vmat, or the names in paths (sky_paths). True if they can be
+    used."""
     ctx.check()
     paths = paths or sky_paths()
     st, detail = build_skybox(sources, content_dir, skyname, config.VTFCMD,
-                              cfg["opts"].get("overwrite", False), ctx.log,
-                              occluder=bool(cfg["opts"].get("sky_occluder", True)), suns=suns,
+                              cfg["opts"].get("overwrite", False), ctx.log, suns=suns,
                               sky_angles=sky_angles, paths=paths)
     report.skybox = f"{skyname}: {t_en('st_' + st)} ({detail})"
     ctx.result("skybox", paths[0], st, detail, "")
@@ -2055,7 +2054,7 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
 
 _VMAP_REF_RE = re.compile(rb"((?:materials|models)/[A-Za-z0-9_\-./ +()]+?\.(?:vmat|vmdl))")
 _SKY_FACE_RE = re.compile(r"^skybox/(.+?)(?:_hdr)?(?:up|dn|lf|rt|ft|bk)$")
-# skybox_moondome: the sky brushes of maps ported by older versions
+# skybox_occluder, skybox_moondome: the sky brushes of maps ported by older versions
 _OWN_MATERIALS = ("skybox/skybox", "skybox/skybox_occluder", "skybox/skybox_moondome", "cs2porter/black",
                   "cs2porter/cable_black")
 # the sky of a map that shares its addon (map_sky_paths): skybox_<map> (older versions:

@@ -526,7 +526,7 @@ _SKY_FACE_RE = re.compile(r"^(.+?)_?(up|dn|lf|rt|ft|bk)$", re.I)
 
 def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
     """Six skybox faces (<name>up / dn / lf / rt / ft / bk, any image format) -> a CS2 cube
-    cross (skybox.png) with skybox.vmat and skybox_occluder.vmat, one folder per sky."""
+    cross (skybox.png) with skybox.vmat, one folder per sky."""
     from . import skybox as skymod
     ok = skip = fail = 0
     for it in items:
@@ -546,8 +546,6 @@ def run_skybox(items, out, opts, log, cfg=None, cancel=None, status=None):
             skymod.compose(imgs, ring, up_rot, dn_rot).save(png, "PNG")
             with open(os.path.join(dst, "skybox.vmat"), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(skymod.SKY_TEMPLATE % {"png": skymod.SKY_PNG})
-            with open(os.path.join(dst, "skybox_occluder.vmat"), "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(skymod.OCCLUDER_TEMPLATE)
             ok += 1
             fit = t("sk_fit", order=" ".join(ring), up=up_rot * 90, dn=dn_rot * 90).strip()
             log(f"  OK  {name}  {fit}", "info")
@@ -568,7 +566,7 @@ CUBE_BIG = 2048
 
 def run_sky_cube(faces, name, out, opts, log):
     """Images the user put on the open cube ({face: path}) -> the same CS2 sky as from Source 1
-    faces (skybox.png, skybox.vmat, skybox_occluder.vmat in out/name). Every image is stretched to
+    faces (skybox.png, skybox.vmat in out/name). Every image is stretched to
     the square face size (nothing is cut off): 2048 when every image is at least that big, else
     1024. A face without an image (or with one that cannot be read) is black. Returns the
     folder, or None."""
@@ -596,8 +594,6 @@ def run_sky_cube(faces, name, out, opts, log):
     skymod.compose(full, CUBE_RING, 0, 0, size).save(png, "PNG")
     with open(os.path.join(dst, "skybox.vmat"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(skymod.SKY_TEMPLATE % {"png": skymod.SKY_PNG})
-    with open(os.path.join(dst, "skybox_occluder.vmat"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(skymod.OCCLUDER_TEMPLATE)
     log(t("sb_done", f=dst, n=len(imgs), size=size), "ok")
     if missing:
         log(t("sb_empty_faces", list=", ".join(t("sb_face_" + f) for f in missing)), "info")

@@ -1,4 +1,4 @@
-"""Source 1 skybox (6 faces) -> CS2 cube cross + skybox.vmat / skybox_occluder.vmat.
+"""Source 1 skybox (6 faces) -> CS2 cube cross + skybox.vmat.
 
 Output layout (3072x4096, 1024 px faces, transparent around the cross):
     [ -  up  - ]
@@ -26,9 +26,9 @@ FACE_SIZE = 1024
 SIDES = ("bk", "rt", "ft", "lf")          # Source default around the horizon: left, front, right, back
 FACES = SIDES + ("up", "dn")
 SKY_VMAT = "materials/skybox/skybox.vmat"
-# the sky brushes: draws the map's sky (env_sky and the 3D skybox) and hides what is behind it.
-# It shows no texture, so every map of an addon uses the same file.
-OCCLUDER_VMAT = "materials/skybox/skybox_occluder.vmat"
+# the sky brushes: CS2's own tool material, draws the map's sky (env_sky and the 3D skybox) and
+# hides what is behind it
+OCCLUDER_VMAT = "materials/tools/toolsskybox_occluder.vmat"
 SKY_PNG = "materials/skybox/skybox.png"
 
 
@@ -55,25 +55,6 @@ Layer0
 	VariableState
 	{
 		"Texture"
-		{
-		}
-	}
-}
-"""
-
-OCCLUDER_TEMPLATE = """// THIS FILE IS AUTO-GENERATED
-
-Layer0
-{
-	shader "sky_occluder.vfx"
-
-	//---- Color ----
-	TextureColor "[1.000000 1.000000 1.000000 0.000000]"
-
-
-	VariableState
-	{
-		"Color"
 		{
 		}
 	}
@@ -506,10 +487,10 @@ def draw_suns(faces, suns, sources, vtfcmd=None, size=FACE_SIZE, sky_angles=None
     return out
 
 
-def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, log=None, occluder=True,
+def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, log=None,
                  suns=None, sky_angles=None, paths=None):
-    """Writes skybox.png, skybox.vmat and (occluder) skybox_occluder.vmat, or the names in paths
-    (see sky_paths). Returns (status, detail).
+    """Writes skybox.png and skybox.vmat, or the names in paths (see sky_paths). Returns
+    (status, detail).
     suns: the map's env_sun entities (see suns_of), drawn into the sky where the CS2 map's
     env_sky (angles sky_angles, None: 0 0 0) shows their direction."""
     log = log or (lambda m, tag="info": None)
@@ -519,7 +500,7 @@ def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, lo
     out_dir = os.path.join(content_dir, "materials", "skybox")
     sky_png = (paths or sky_paths())[2]
     vmats = [os.path.join(content_dir, *p.split("/")) for p in (paths or sky_paths())]
-    needed = vmats if occluder else (vmats[0], vmats[2])
+    needed = (vmats[0], vmats[2])
     if not overwrite and all(os.path.isfile(p) for p in needed):
         return "exists", t("m_exists")
 
@@ -546,9 +527,6 @@ def build_skybox(sources, content_dir, skyname, vtfcmd=None, overwrite=False, lo
     compose(faces, ring, up_rot, dn_rot).save(vmats[2], "PNG")
     with open(vmats[0], "w", encoding="utf-8", newline="\n") as fh:
         fh.write(SKY_TEMPLATE % {"png": sky_png})
-    if occluder:
-        with open(vmats[1], "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(OCCLUDER_TEMPLATE)
     missing = [f for f in FACES if f not in faces]
     detail = t("sk_faces", n=len(faces)) + (t("sk_missing_faces", list=", ".join(missing)) if missing else "")
     if suns:

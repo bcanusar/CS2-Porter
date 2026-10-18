@@ -322,6 +322,13 @@ _RENDERMODE = {
     "3": "kRenderGlow", "4": "kRenderTransAlpha", "5": "kRenderTransAdd",
     "7": "kRenderTransAddFrameBlend", "9": "kRenderWorldGlow", "10": "kRenderNone",
 }
+# keys that are whole numbers (choices / flags) in both games; maps made by other tools can hold
+# words in them ("disableshadows" "Yes")
+_INT_KEYS = {
+    "disableshadows", "disablereceiveshadows", "disableflashlight", "disableselfshadowing",
+    "disablevertexlighting", "disablebonefollowers", "startdisabled", "solid", "spawnflags",
+    "renderamt", "ignorenormals", "screenspacefade", "nodamageforces", "randomanimation",
+}
 
 
 def _fix_base(root):
@@ -2839,7 +2846,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
              "skiphint_removed": 0, "skiphint_replaced": 0, "skybox": 0, "ladders": 0,
              "booster": 0, "filters": 0, "meshes": 0, "teleports": 0, "boost": 0, "split": 0,
              "floor": 0, "effects": 0, "removed": 0, "bhop_blocks": 0, "flag_triggers": 0, "trigger_clip": 0,
-             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0}
+             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0, "int_keys": 0}
     _fix_base(root)
     stats["removed"] = _remove_classes(root)
     stats["cubemaps"] = _remove_classes(root, CUBEMAP_CLASSES)
@@ -2894,6 +2901,11 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                 elif kl == "skin" and item[1] == "0":
                     item[1] = "default"
                     stats["skins"] += 1
+                elif kl in _INT_KEYS and not re.fullmatch(r"\s*-?\d+\s*", item[1] or ""):
+                    # Source 1 read these with atoi ("Yes" -> 0); CS2 refuses text in an int key
+                    m = re.match(r"\s*([+-]?\d+)", item[1] or "")
+                    item[1] = str(int(m.group(1))) if m else "0"
+                    stats["int_keys"] += 1
         if _fix_dynamic_prop(ent):
             stats["dynprops"] += 1
         if _fix_model_scale(ent):
@@ -2933,7 +2945,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks", "weaponstrip", "beam_sparks"):
+                  "landmarks", "weaponstrip", "beam_sparks", "int_keys"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

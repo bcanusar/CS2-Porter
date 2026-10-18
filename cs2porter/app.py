@@ -3113,17 +3113,15 @@ class App:
 
         ttk.Label(g, text=t("set_options"), style="Section.TLabel").grid(row=r, column=0, sticky="w", pady=(16, 4))
         r += 1
-        # what is written and how (left), what the map gets (right, in two columns sharing the
-        # rest of the width)
+        # what is written and how (left), what the map gets (right, in two columns). Every group
+        # keeps the width its texts need; when the window is too narrow they go below each other
+        # (see reflow) instead of being cut off
         of = ttk.Frame(g, style="Card.TFrame")
         of.grid(row=r, column=0, columnspan=3, sticky="ew")
-        of.columnconfigure(1, weight=1)
         left = ttk.Frame(of, style="Card.TFrame")
         left.grid(row=0, column=0, sticky="nw")
         right = ttk.Frame(of, style="Card.TFrame")
-        right.grid(row=0, column=1, sticky="new", padx=(24, 0))
-        right.columnconfigure(0, weight=1, uniform="look")
-        right.columnconfigure(1, weight=1, uniform="look")
+        right.grid(row=0, column=1, sticky="nw", padx=(24, 0))
         self.opt_vars = {}
         tips = {"light_probes": "opt_light_probes_tip", "post_processing": "opt_post_processing_tip",
                 "bhop_blocks": "opt_bhop_blocks_tip", "sky_occluder": "opt_sky_occluder_tip", "sun_in_sky": "opt_sun_in_sky_tip", "sky3d": "opt_sky3d_tip",
@@ -3171,6 +3169,27 @@ class App:
                                      ("sky3d", "opt_sky3d"), ("mip_fade", "opt_mip_fade")))):
             for key, label in opts:
                 add_opt(col, key, label)
+
+        def reflow(_e=None):
+            w = of.winfo_width()
+            if w <= 1:
+                return
+            gap = 24
+            looks = cols[0].winfo_reqwidth() + gap + cols[1].winfo_reqwidth()
+            mode = (left.winfo_reqwidth() + gap + looks <= w, looks <= w)
+            if mode == getattr(of, "_mode", None):
+                return
+            of._mode = mode
+            if mode[0]:
+                right.grid_configure(row=0, column=1, padx=(gap, 0), pady=0)
+            else:
+                right.grid_configure(row=1, column=0, padx=0, pady=(12, 0))
+            if mode[1]:
+                cols[1].grid_configure(row=1, column=1, padx=(gap, 0), pady=0)
+            else:
+                cols[1].grid_configure(row=2, column=0, padx=0, pady=0)
+
+        of.bind("<Configure>", reflow, add="+")
         r += 1
         # work files of the ports (decompiled map, files taken from the .bsp) pile up over time
         ttk.Label(g, text=t("set_work"), style="Section.TLabel").grid(row=r, column=0, sticky="w", pady=(16, 4))

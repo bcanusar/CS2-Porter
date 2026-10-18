@@ -91,7 +91,7 @@ DEFAULTS = {
         "light_probes": True,
         "port_particles": True,
         "post_processing": True,
-        # sky brushes get skybox_occluder.vmat (off: they stay tools/toolsskybox.vmat)
+        # sky brushes get tools/toolsskybox_occluder.vmat (off: they stay tools/toolsskybox.vmat)
         "sky_occluder": True,
         # a model material found nowhere is replaced by a CS2 material, so the model compiles
         "model_placeholder": True,

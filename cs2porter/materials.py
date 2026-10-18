@@ -1169,10 +1169,12 @@ class MaterialConverter:
         return SOFT_BLEND_TEX
 
     def _tinted(self, color, tint):
-        """color texture multiplied by tint (csgo_unlitgeneric ignores its color tint), the same
+        """color texture multiplied by tint (csgo_unlitgeneric ignores its color tint, the lit
+        templates have none), the same
         texture when the tint is white or the texture can not be read."""
         if color.startswith("[") or all(abs(c - 1.0) < 1e-3 for c in tint):
             return color
+        # Source 1 takes $color as a gamma value (it multiplies the texture as it is seen)
         tag = "".join(f"{min(max(int(round(c * 255)), 0), 255):02x}" for c in tint)
         out_rel = color.rsplit(".", 1)[0] + f"_tint_{tag}.tga"
         out = self._abs(out_rel)
@@ -1507,6 +1509,10 @@ class MaterialConverter:
         is_model = "model" in usages
         is_foliage = is_model and (surface == "foliage" or any(any(s.startswith(k) for k in _FOLIAGE_KW) for s in segs))
         scroll = texture_scroll(vmt)
+        if not is_unlit and not vmt.flag("$additive") and not _proxy_writes(vmt, "$color"):
+            # Source 1 multiplies a lit surface by $color; the templates have no tint, so it
+            # goes into the texture (maps built from one white texture and many colors)
+            color = self._tinted(color, vmt_color(vmt) or (1.0, 1.0, 1.0))
 
         if shader in _BLEND_SHADERS and color2:
             content = VC.TMPL_WORLDVERTEX.format(
@@ -1533,7 +1539,8 @@ class MaterialConverter:
                 color=color, normal=normal_path, mask=WHITE_MASK, brightness=f"{bright:.3f}", albedo="0.000",
                 tint=f"[{tint[0]:.6f} {tint[1]:.6f} {tint[2]:.6f} 0.000000]", sysattr=sysattr)
             tag = t("m_texture_light", b=f"{bright:.2f}")
-        elif vmt.flag("$selfillum") and not is_decal:
+        elif vmt.flag("$selfillum") and not is_decal and not is_unlit:
+            # (an unlit surface is fully bright anyway: it keeps its $color and $alpha below)
             mask = self._self_illum_mask(vmt, color, is_unlit)
             raw_tint = vmt.get("$selfillumtint") or ""
             tint = (_floats(raw_tint, 1 / 255.0 if "{" in raw_tint else 1.0) + [1.0, 1.0, 1.0])[:3]
@@ -1554,6 +1561,18 @@ class MaterialConverter:
                 if layers:
                     color, trans = layers
                     transparent = True
+            if not is_unlit and not _proxy_writes(vmt, "$alpha"):
+                # Source 1 blends a lit surface by $alpha even without $translucent
+                try:
+                    opacity = min(max(float(_floats(vmt.get("$alpha", "1"))[0]), 0.0), 1.0)
+                except IndexError:
+                    opacity = 1.0
+                if opacity < 0.999 and not (transparent and trans):
+                    transparent = True
+                    trans = f"[{opacity:.6f} {opacity:.6f} {opacity:.6f} 0.000000]"
+                    opacity = 1.0
+            else:
+                opacity = 1.0
             if is_foliage and (transparent or vmt.flag("$alphatest") or vmt.flag("$translucent")):
                 slot = {"TextureLayer1Color": color, "TextureLayer1Normal": normal_path}
                 if transparent and trans:
@@ -1636,6 +1655,9 @@ class MaterialConverter:
             else:
                 content = VC.TMPL_BASIC.format(color=color, sysattr=sysattr)
                 tag = "basic"
+            if opacity < 0.999:
+                # $alpha on top of a translucent texture
+                content = content.replace('g_flOpacityScale "1.000"', f'g_flOpacityScale "{opacity:.3f}"')
 
         os.makedirs(os.path.dirname(vmat_abs), exist_ok=True)
         with open(vmat_abs, "w", encoding="utf-8") as f:
