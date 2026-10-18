@@ -855,8 +855,11 @@ class MaterialConverter:
     """Writes the missing materials into a target content folder (addon)."""
 
     def __init__(self, sources, index, content_dir, vtfcmd=None, log=None,
-                 overwrite=False, convert_cs2_existing=False, texture_lights=None):
+                 overwrite=False, convert_cs2_existing=False, texture_lights=None, fullbright=False):
         self.sources = sources
+        # the map has no baked light (lighting.fullbright_map): its lit world materials become
+        # unlit, as bright as Source 1 drew them
+        self.fullbright = fullbright
         # {material: (r, g, b)} glow of the map's texture lights (texlights.texture_lights)
         self.texture_lights = texture_lights or {}
         self.index = index
@@ -868,6 +871,8 @@ class MaterialConverter:
         self.tex_cache = {}
         self.sprite_textures = {}       # sprite material -> its texture (glow particles use it)
         self.cs2_broken = set()         # materials CS2 has but draws wrong (converted anyway)
+        self.cs2_fallback = set()       # CS2 has them, converted for a fully bright map
+        # (CS2's copy is used when the Source 1 one can not be converted)
         self.results = {}
         self.extra_textures = 0
         VC.set_base_dir(content_dir)
@@ -1057,6 +1062,8 @@ class MaterialConverter:
             elif res.status in ("missing", "error", "unsupported"):
                 # no Source 1 material to convert: CS2's own copy is still better than none
                 res = MaterialResult(mat, "cs2", t("m_cs2"), res.source)
+        elif mat in self.cs2_fallback and res.status in ("missing", "error", "unsupported"):
+            res = MaterialResult(mat, "cs2", t("m_cs2"), res.source)
         self.results[mat] = res
         return res
 
@@ -1072,7 +1079,12 @@ class MaterialConverter:
         if not self.overwrite and self.index.in_addon(vmat_rel):
             return MaterialResult(mat, "exists", t("m_exists"))
         # a texture light needs its own glowing material, also when CS2 has one of that name
-        if not self.convert_cs2_existing and self.index.in_cs2(f"{vmat_rel}_c") and mat not in self.texture_lights:
+        # (a fully bright map needs its own unlit copies, CS2's materials are lit)
+        if self.fullbright and {"brush", "brushent"} & usages and not self.convert_cs2_existing \
+                and self.index.in_cs2(f"{vmat_rel}_c"):
+            self.cs2_fallback.add(mat)
+        elif not self.convert_cs2_existing and self.index.in_cs2(f"{vmat_rel}_c") \
+                and mat not in self.texture_lights:
             if not self.index.broken_in_cs2(f"{vmat_rel}_c"):
                 return MaterialResult(mat, "cs2", t("m_cs2"))
             # CS2's material of this name draws wrong: the Source 1 one is converted
@@ -1505,7 +1517,8 @@ class MaterialConverter:
                     or (("overlay" in usages or "decal" in usages) and not on_brush)
                     or ((vmt.flag("$decal") or VC._keyword_hit(lower, "decal")) and not on_brush))
         is_glass = VC._keyword_hit(lower, "glass")
-        is_unlit = shader in _UNLIT_SHADERS
+        is_unlit = shader in _UNLIT_SHADERS or (
+            self.fullbright and on_brush and (shader.startswith("lightmapped") or shader == "worldvertextransition"))
         is_model = "model" in usages
         is_foliage = is_model and (surface == "foliage" or any(any(s.startswith(k) for k in _FOLIAGE_KW) for s in segs))
         scroll = texture_scroll(vmt)

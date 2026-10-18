@@ -39,7 +39,7 @@ LUMEN_SCALE = (200.0 / 255.0) * 100.0 ** 2 / 1000.0
 # range: where the CS2 light falls under about 1 / 200 (same as vmap.LIGHT_RANGE_PER_LUMEN)
 RANGE_PER_LUMEN = 41.0
 MIN_LUMENS = 1.0
-MAX_LUMENS = 100000.0
+MAX_LUMENS = 400000.0       # range 41 x sqrt(lumens) stays under vmap.MAX_LIGHT_RANGE
 
 # line traces: surfaces closer than NEAR are lit to full white in both games and are left out
 # (unless a light has almost nothing else around it); Source 1 light is counted up to CAP
@@ -222,6 +222,29 @@ def _disp_hits(disp, start, directions, length):
     return out
 
 
+LUMP_LIGHTING = 8
+
+
+def _lightmap_lit(data):
+    """True when a lightmap lump (ColorRGBExp32 luxels) has a luxel brighter than black."""
+    n = len(data) - len(data) % 4
+    if np is not None:
+        return bool(np.frombuffer(data, dtype=np.uint8, count=n).reshape(-1, 4)[:, :3].any())
+    return any(data[i] or data[i + 1] or data[i + 2] for i in range(0, n, 4))
+
+
+def fullbright_map(info):
+    """True when the map has no baked light at all (no lightmaps, or only black ones): such a
+    map was played fully bright in Source 1, every lit world surface showing its own texture."""
+    try:
+        for idx in (LUMP_LIGHTING, LUMP_LIGHTING_HDR):
+            if info.lumps[idx][1] > 0 and _lightmap_lit(info.read_lump(idx)):
+                return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def world_lights(info):
     """{position: light} of the light list in the .bsp (the HDR one when the map has HDR
     lighting). light: {"type", "intensity" (r, g, b), "c", "l", "q", "radius", "normal",
@@ -350,10 +373,13 @@ def source1_light(light, color, d):
     """Brightness of the light d units away in Source 1 units, for a white color."""
     if light["radius"] and d > light["radius"]:
         return 0.0
+    peak = max(color) if color else 1.0
+    if light.get("linear"):
+        # dynamic light (convert_dynamic_lights): falls off linearly to 0 at its radius
+        return max(light["intensity"]) * max(0.0, 1.0 - d / light["radius"]) / max(peak, 1e-3)
     att = light["c"] + light["l"] * d + light["q"] * d * d
     if att <= 0:
         return 0.0
-    peak = max(color) if color else 1.0
     return max(light["intensity"]) / att / max(peak, 1e-3)
 
 
@@ -380,7 +406,7 @@ def match_lumens(light, color, distances):
 
 
 def light_values(root, info=None, tracer=None):
-    """{position: {"lumens", "range", "cone"}} for the point and spot lights of the VMF.
+    """{position: {"lumens", "range"}} for the point and spot lights of the VMF.
     info: the .bsp (BSPInfo) when the map is ported from one."""
     compiled = world_lights(info) if info is not None else {}
     out = {}
@@ -403,9 +429,102 @@ def light_values(root, info=None, tracer=None):
         if res is None:
             continue
         lumens, rng = res
-        val = {"lumens": lumens, "range": rng}
-        if light["type"] == EMIT_SPOT:
-            # a spot light's lumens only fill its cone
-            val["cone"] = min(max((1.0 - light["stopdot2"]) / 2.0, 0.01), 1.0)
-        out[key] = val
+        # (no cone factor for spot lights: CS2 gives a light_barn the same intensity as a
+        # light_omni2 of the same lumens, checked in a compiled map)
+        out[key] = {"lumens": lumens, "range": rng}
     return out
+
+
+# --- light_dynamic -----------------------------------------------------------------------------
+
+DLIGHT_DISTANCE = 120.0         # light_dynamic defaults (Source 1 FGD)
+DLIGHT_SPOT_RADIUS = 80.0
+DLIGHT_CONE = 45.0
+DLIGHT_NO_WORLD = 1             # spawnflag: does not light the world
+DLIGHT_MIN_OFFSET = 4.0
+_DLIGHT_KEYS = ("brightness", "distance", "spotlight_radius", "_inner_cone", "_cone", "pitch", "spawnflags")
+
+
+def _first_hit(tracer, start, direction, length):
+    d = tracer.trace(start, direction, length)
+    return None if d is None or d >= length - 1e-3 else d
+
+
+def convert_dynamic_lights(root, tracer=None):
+    """CS2 has no light_dynamic (the importer keeps the class, Hammer shows it as obsolete). It
+    becomes a static light where it lights the world in Source 1:
+    with a cone (_cone > 0) only its spotlight end lights the world: a light of radius
+    spotlight_radius where a line from the entity along its direction hits a surface within
+    distance, its color times (1 - hit fraction)^2. Without a cone it lights the world from its
+    own place up to distance. The light is color / 255 x 2^brightness at its place and falls off
+    linearly to its radius (an approximation of the Source 1 dynamic light on lightmaps).
+    Lights that only light models are removed.
+    Returns ({pos_key: {"lumens", "range"}} of the new lights, removed count)."""
+    dyn = [e for e in root.children("entity") if e.classname == "light_dynamic"]
+    if not dyn:
+        return {}, 0
+    if tracer is None:
+        tracer = vmfmod.BrushTracer(root)
+    values, drop = {}, []
+    for ent in dyn:
+        num = lambda k, d: vmfmod._float(ent.get(k), d)  # noqa: E731
+        pos = vmfmod._vec(ent.get("origin"))
+        parts = (ent.get("_light") or "").split()
+        try:
+            rgb = [float(v) for v in parts[:3]]
+        except ValueError:
+            rgb = []
+        if len(rgb) == 1:
+            rgb *= 3
+        color = light_color(ent.get("_light"))
+        if (pos is None or not all(math.isfinite(v) for v in pos) or len(rgb) != 3 or not color
+                or max(color) <= 0 or int(num("spawnflags", 0.0)) & DLIGHT_NO_WORLD):
+            drop.append(ent)
+            continue
+        radius = num("distance", DLIGHT_DISTANCE)
+        peak = max(rgb) / 255.0 * 2.0 ** min(max(num("brightness", 0.0), -8.0), 8.0)
+        fwd = vmfmod._forward(_angles(ent))
+        hit, back, dist = pos, None, 0.0
+        if num("_cone", DLIGHT_CONE) > 0:
+            dist = _first_hit(tracer, pos, fwd, radius) if radius > 0 else None
+            if dist is None:
+                drop.append(ent)
+                continue
+            peak *= (1.0 - dist / radius) ** 2
+            radius = num("spotlight_radius", DLIGHT_SPOT_RADIUS)
+            hit = tuple(pos[k] + fwd[k] * dist for k in range(3))
+            back = tuple(-v for v in fwd)
+        if radius <= 0 or peak <= 0:
+            drop.append(ent)
+            continue
+        light = {"type": EMIT_POINT, "intensity": (peak,) * 3, "c": 1.0, "l": 0.0, "q": 0.0,
+                 "radius": radius, "linear": True}
+        start = hit if back is None else tuple(hit[k] + back[k] for k in range(3))
+        if hasattr(tracer, "trace_all"):
+            dists = tracer.trace_all(start, _DIRS)
+        else:
+            dists = [_first_hit(tracer, start, d, TRACE_DIST) for d in _DIRS]
+        res = match_lumens(light, color, dists)
+        if res is None:
+            drop.append(ent)
+            continue
+        lumens, rng = res
+        new = pos
+        if back is not None:
+            # as far off the surface as the CS2 light has to be to give its middle the Source 1
+            # brightness (CS2: lumens x LUMEN_SCALE / d^2), between the entity and the surface
+            off = math.sqrt(lumens * LUMEN_SCALE * max(color) / peak)
+            off = min(max(off, DLIGHT_MIN_OFFSET), radius / 2.0, max(dist, DLIGHT_MIN_OFFSET))
+            new = tuple(hit[k] + back[k] * off for k in range(3))
+        for k in _DLIGHT_KEYS:
+            ent.remove_key(k)
+        ent.set("classname", "light")
+        ent.set("origin", " ".join(vmfmod._fmt(v) for v in new))
+        # 4th value: the importer makes 5 lumens of 1
+        ent.set("_light", " ".join(vmfmod._fmt(v) for v in rgb) + " " + vmfmod._fmt(lumens / 5.0))
+        ent.set("_distance", vmfmod._fmt(rng))
+        values[vmfmod.pos_key(new)] = {"lumens": lumens, "range": rng}
+    if drop:
+        ids = {id(e) for e in drop}
+        root.items = [i for i in root.items if id(i) not in ids]
+    return values, len(drop)

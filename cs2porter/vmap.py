@@ -452,6 +452,8 @@ def fix_lights(text, table, lumens=True):
                     ch[k] = info[k]
         elif cls in _POINT_LIGHTS:
             info = pick(cls, origin)
+            # (not Stationary: the compiler gives at most 4 overlapping Stationary lights a baked
+            # shadow slot, "Assigned 21 Light Shadow Slots, 17 failed (max slot 3)")
             ch = {"bouncelight": "-1", "skirt": "0.1"}
             if cls == "light_barn":
                 ch["skirt_near"] = "0.05"
@@ -503,6 +505,23 @@ def _conn_text(ind, fields):
     return f'{ind}"DmeConnectionData"\n{ind}{{\n{body}\n{ind}}}'
 
 
+_NUM_PREFIX_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _bhop_numbers(value, count):
+    """Reads the value the way Source 1 does (atof per word): a word that is not a
+    number ("boostAmountX") is 0 and missing words are 0, so the script gets numbers."""
+    words = value.split()
+    out = []
+    for i in range(count):
+        m = _NUM_PREFIX_RE.match(words[i]) if i < len(words) else None
+        n = float(m.group(0)) if m else 0.0
+        if not math.isfinite(n):
+            n = 0.0
+        out.append(str(int(n)) if n == int(n) else f"{n:g}")
+    return " ".join(out)
+
+
 def _set(fields, key, value):
     return [(k, typ, value if k == key else v) for k, typ, v in fields]
 
@@ -539,6 +558,7 @@ def rewrite_connections(text, bhop, attributes):
         value = words[1].strip() if len(words) > 1 else ""
         if bhop and key in _BHOP_KEYS:
             counts[0] += 1
+            value = _bhop_numbers(value, 3 if key == "basevelocity" else 1)
             new = _set(_set(_set(fields, "targetName", BHOP_CASE), "inputName", "InValue"),
                        "overrideParam", f"{_BHOP_KEYS[key]} {value}".strip())
             return _conn_text(ind, new)

@@ -1106,6 +1106,51 @@ def _zones_to_triggers(root):
 SPAWNS_WANTED = 20
 
 
+SPAWN_CLASSES = ("info_player_terrorist", "info_player_counterterrorist", "info_player_start")
+SPAWN_LIFT = 2.0            # units a spawn point is put above the floor it sat on
+SPAWN_SINK = 8.0            # a spawn point this far down in the floor is still lifted
+PLAYER_HALF = 15.5          # player box half width (16), a little in from its sides
+PLAYER_HEIGHT = 72.0
+
+
+def _lift_spawns(root):
+    """CS2 does not spawn players at a spawn point that sits right on (or a little in) the
+    floor, Source 1 did. Such points are moved up to just above the floor when the player box
+    fits there; the others are left as they are. Returns the number moved."""
+    spawns = [e for e in root.children("entity") if e.classname in SPAWN_CLASSES]
+    if not spawns:
+        return 0
+    tracer = BrushTracer(root)
+    cols = [(0.0, 0.0)] + [(sx * PLAYER_HALF, sy * PLAYER_HALF) for sx in (-1, 1) for sy in (-1, 1)]
+    moved = 0
+    for ent in spawns:
+        o = _vec(ent.get("origin") or "")
+        if not o or not all(math.isfinite(c) for c in o):
+            continue
+        floor = None
+        for dx, dy in cols:
+            start = (o[0] + dx, o[1] + dy, o[2] + SPAWN_SINK)
+            if tracer.inside(start):
+                floor = None
+                break
+            hit = tracer.trace(start, (0.0, 0.0, -1.0), SPAWN_SINK + 0.5)
+            if hit < SPAWN_SINK + 0.5:
+                z = start[2] - hit
+                floor = z if floor is None else max(floor, z)
+        else:
+            if floor is None or floor < o[2] - 0.01:
+                continue            # not on the floor
+            z = floor + SPAWN_LIFT
+            free = all(not tracer.inside((o[0] + dx, o[1] + dy, z + 0.01))
+                       and tracer.trace((o[0] + dx, o[1] + dy, z + 0.01), (0.0, 0.0, 1.0),
+                                        PLAYER_HEIGHT) >= PLAYER_HEIGHT - 0.01
+                       for dx, dy in cols)
+            if free:
+                ent.set("origin", f"{_fmt(o[0])} {_fmt(o[1])} {_fmt(round(z, 2))}")
+                moved += 1
+    return moved
+
+
 def _fill_spawns(root):
     """Both teams get at least SPAWNS_WANTED spawn points, the added ones all on one existing
     spawn point (a terrorist one first). Returns the number added."""
@@ -1958,7 +2003,7 @@ def _lumens_text(v):
 def collect_lights(root, values=None):
     """[(cs2_class, (x, y, z), info)] for vmap.fix_lights.
     Point and spot lights: values from lighting.light_values (by position) give info["lumens"]
-    and info["range"] (a spot light's lumens only fill its cone). Without values: info["lumens"]
+    and info["range"]. Without values: info["lumens"]
     = 4th value of _light, info["range"] = _distance or _zero_percent_distance when the map sets
     one.
     light_environment: Source 1 stores the sun and the ambient light in 0-255 units that the
@@ -1988,7 +2033,7 @@ def collect_lights(root, values=None):
         elif values is not None:
             val = values.get(pos_key(pos))
             if val:
-                info["lumens"] = _lumens_text(val["lumens"] * val.get("cone", 1.0))
+                info["lumens"] = _lumens_text(val["lumens"])
                 info["range"] = val["range"]
         else:
             parts = (ent.get("_light") or "").split()
@@ -2001,6 +2046,82 @@ def collect_lights(root, values=None):
                     break
         out.append((cls, pos, info))
     return out
+
+
+VIS_CELL = 256.0            # visibility_hint grid (vmap.VIS_HINT_TYPE), from the low corner of its box
+VIS_CELL_AIR = 0.5          # a light in a cell with less open space than this gets no light at all
+VIS_CELL_MARGIN = 8.0       # how far into the next cell a light is moved
+VIS_CELL_MAX_MOVE = 128.0
+_VIS_SAMPLES = 4            # per axis, open space of a cell
+
+
+def _cell_air(tracer, lo, hi):
+    """Part of the box (lo, hi) that is not inside world / func_detail brushes."""
+    solids = [(s, pts) for mins, maxs, s, pts in tracer.solids
+              if all(maxs[k] > lo[k] and mins[k] < hi[k] for k in range(3))]
+    if not solids:
+        return 1.0
+    step = [(hi[k] - lo[k]) / _VIS_SAMPLES for k in range(3)]
+    free = total = 0
+    for i in range(_VIS_SAMPLES):
+        for j in range(_VIS_SAMPLES):
+            for m in range(_VIS_SAMPLES):
+                p = (lo[0] + (i + 0.5) * step[0], lo[1] + (j + 0.5) * step[1], lo[2] + (m + 0.5) * step[2])
+                total += 1
+                if not any(all(n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d <= 0
+                               for n, d in tracer._brush_planes(s, pts)) for s, pts in solids):
+                    free += 1
+    return free / total
+
+
+def move_lights_off_solid_cells(root, bounds):
+    """CS2 bakes no light at all for a light whose visibility cell (the 256 unit grid of the
+    visibility_hint over bounds) is mostly inside brushes, as a light just under a thick
+    ceiling. Such lights move to just inside the nearest open neighbor cell (straight line, no
+    brush in the way). Returns {pos_key(old): new position}."""
+    lights = [e for e in root.children("entity") if e.classname in ("light", "light_spot", "light_dynamic")]
+    if not lights or not bounds:
+        return {}
+    base = [math.floor(v + 0.01) for v in bounds[0]]
+    tracer = BrushTracer(root)
+    air_cache = {}
+
+    def air(cell):
+        if cell not in air_cache:
+            lo = tuple(base[k] + cell[k] * VIS_CELL for k in range(3))
+            air_cache[cell] = _cell_air(tracer, lo, tuple(v + VIS_CELL for v in lo))
+        return air_cache[cell]
+
+    moved = {}
+    for ent in lights:
+        p = _vec(ent.get("origin"))
+        if p is None or not all(math.isfinite(v) for v in p):
+            continue
+        cell = tuple(int(math.floor((p[k] - base[k]) / VIS_CELL)) for k in range(3))
+        if air(cell) >= VIS_CELL_AIR:
+            continue
+        best = None
+        for axis in range(3):
+            for sgn in (-1, 1):
+                edge = base[axis] + (cell[axis] + (1 if sgn > 0 else 0)) * VIS_CELL
+                new = list(p)
+                new[axis] = edge + sgn * VIS_CELL_MARGIN
+                dist = abs(new[axis] - p[axis])
+                if dist > VIS_CELL_MAX_MOVE or (best and dist >= best[0]):
+                    continue
+                ncell = list(cell)
+                ncell[axis] += sgn
+                direction = [0.0, 0.0, 0.0]
+                direction[axis] = float(sgn)
+                if air(tuple(ncell)) < VIS_CELL_AIR or tracer.inside(new) \
+                        or tracer.trace(p, direction, dist) < dist - 0.01:
+                    continue
+                best = (dist, tuple(new))
+        if best:
+            new = best[1]
+            ent.set("origin", " ".join(_fmt(round(v, 2)) for v in new))
+            moved[pos_key(p)] = new
+    return moved
 
 
 def pos_key(values):
@@ -2818,6 +2939,29 @@ def _remove_classes(root, classes=REMOVED_CLASSES):
     return before - len(root.items)
 
 
+# func_ classes that are point entities (or get their shape elsewhere) and have no brushes
+_POINT_FUNC_CLASSES = {"func_instance", "func_instance_parms", "func_instance_io_proxy",
+                       "func_useableladder", "func_ladderendpoint", "func_areaportal",
+                       "func_areaportalwindow", "func_occluder", "func_viscluster"}
+
+
+def _is_empty_brush_entity(ent):
+    cls = (ent.classname or "").lower()
+    if not (cls.startswith("trigger_") or cls.startswith("func_")) or cls in _POINT_FUNC_CLASSES:
+        return False
+    return not ent.children("solid") and not any(h.children("solid") for h in ent.children("hidden"))
+
+
+def _remove_empty_brush_entities(root):
+    """Brush entities without a brush (the .bsp had no model for them, often with a NaN
+    origin) do nothing in Source 1 either; in CS2 Hammer they are empty entities with an
+    invalid bounding box, so they are removed."""
+    before = len(root.items)
+    root.items = [i for i in root.items
+                  if not (isinstance(i, VNode) and i.name.lower() == "entity" and _is_empty_brush_entity(i))]
+    return before - len(root.items)
+
+
 # radius of assets/glow_particle.vpcf at scale 1
 LIGHTGLOW_RADIUS = 48.0
 
@@ -2846,11 +2990,13 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
              "skiphint_removed": 0, "skiphint_replaced": 0, "skybox": 0, "ladders": 0,
              "booster": 0, "filters": 0, "meshes": 0, "teleports": 0, "boost": 0, "split": 0,
              "floor": 0, "effects": 0, "removed": 0, "bhop_blocks": 0, "flag_triggers": 0, "trigger_clip": 0,
-             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0, "int_keys": 0}
+             "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0, "int_keys": 0, "empty": 0, "lifted": 0}
     _fix_base(root)
     stats["removed"] = _remove_classes(root)
     stats["cubemaps"] = _remove_classes(root, CUBEMAP_CLASSES)
+    stats["empty"] = _remove_empty_brush_entities(root)
     stats["zones"] = _zones_to_triggers(root)
+    stats["lifted"] = _lift_spawns(root)
     stats["spawns"] = _fill_spawns(root)
     stats["nonsolid"] = _nonsolid_disps(root)
     if sky_alias:
@@ -2938,6 +3084,8 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["beam_sparks"] = _beam_sparks(root)
     stats["effects"] = _effects_to_particles(root, effects if effects is not None else {})
     stats["skiphint_removed"], stats["skiphint_replaced"] = _remove_skip_hint(root)
+    # removing the hint brushes can leave a brush entity empty
+    stats["empty"] += _remove_empty_brush_entities(root)
     if log:
         from .i18n import t
         parts = []
@@ -2945,7 +3093,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks", "weaponstrip", "beam_sparks", "int_keys"):
+                  "landmarks", "weaponstrip", "beam_sparks", "int_keys", "empty", "lifted"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

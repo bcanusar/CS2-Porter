@@ -494,7 +494,7 @@ def _texture_lights(ctx, info):
 
 
 def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, game_dir,
-                   staging_dir, valve, p0=0.3, p1=0.9, texture_lights=None, model_skins=None):
+                   staging_dir, valve, p0=0.3, p1=0.9, texture_lights=None, model_skins=None, fullbright=False):
     """materials: {mat: set(usage)}, models: {mdl: count}, model_skins: {mdl: skins the map
     uses, None = any}"""
     opts = cfg["opts"]
@@ -504,7 +504,7 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
     matconv = MaterialConverter(sources, index, content_dir, config.VTFCMD, ctx.log,
                                 overwrite=opts.get("overwrite", False),
                                 convert_cs2_existing=opts.get("convert_cs2_existing", False),
-                                texture_lights=texture_lights)
+                                texture_lights=texture_lights, fullbright=fullbright)
     qc_index = QCIndex(sources.resource_sources(), config.CACHE_DIR, ctx.log)
     if qc_index.by_model:
         ctx.log(t("p_qc_index", n=len(qc_index.by_model)), "dim")
@@ -1442,19 +1442,38 @@ def _light_setup(ctx, opts, root, info, tracer):
         if rooms:
             voxels = sum((hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]) for lo, hi, _r in rooms) / 108.0 ** 3
             ctx.detail(t("d_light_rooms", n=len(rooms), rooms=sum(1 for r in rooms if r[2]), k=round(voxels / 1000)))
-    return _lights_of(ctx, opts, root, info, tracer), bounds, rooms
+    try:
+        dynamic, dropped = lightingmod.convert_dynamic_lights(root, tracer)
+    except Exception:  # noqa: BLE001 - they stay light_dynamic
+        dynamic, dropped = {}, 0
+    if dynamic or dropped:
+        ctx.log(t("p_dynamic_lights", n=len(dynamic), k=dropped), "info")
+    lights = _lights_of(ctx, opts, root, info, tracer, dynamic)
+    # (after the brightness: that is worked out at the light's own place)
+    try:
+        moved = vmfmod.move_lights_off_solid_cells(root, bounds)
+    except Exception:  # noqa: BLE001 - the lights just stay where they are
+        moved = {}
+    if moved:
+        lights = [(cls, moved.get(vmfmod.pos_key(pos), pos), inf) for cls, pos, inf in lights]
+        ctx.log(t("p_lights_moved", n=len(moved)), "info")
+    return lights, bounds, rooms
 
 
-def _lights_of(ctx, opts, root, info, tracer):
-    """Lights of the map for the .vmap fixes (vmf.collect_lights)."""
+def _lights_of(ctx, opts, root, info, tracer, dynamic=None):
+    """Lights of the map for the .vmap fixes (vmf.collect_lights). dynamic: values of the lights
+    made from light_dynamic (lighting.convert_dynamic_lights), they win over light_values."""
     if not opts.get("fix_light_brightness", True):
         return vmfmod.collect_lights(root)
     try:
         values = lightingmod.light_values(root, info if tracer is not None else None, tracer)
     except Exception:  # noqa: BLE001
         values = lightingmod.light_values(root)
+    if dynamic:
+        values = dict(values or {})
+        values.update(dynamic)
     if values:
-        lum = sorted(v["lumens"] * v.get("cone", 1.0) for v in values.values())
+        lum = sorted(v["lumens"] for v in values.values())
         ctx.detail(t("d_light_lumens", n=len(lum), lo=lum[0], mid=lum[len(lum) // 2], hi=lum[-1]))
     return vmfmod.collect_lights(root, values)
 
@@ -1761,9 +1780,14 @@ def port_map(cfg, ctx, input_path, addon_name):
         # --- 5) missing assets ---------------------------------------------------------
         if os.path.isdir(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
+        # a map without baked light was drawn fully bright in Source 1
+        fullbright = not is_vmf and lightingmod.fullbright_map(info)
+        if fullbright:
+            ctx.log(t("p_fullbright"), "info")
         convert_assets(cfg, ctx, report, sources, materials, models,
                        content_dir, game_dir, staging_dir, valve if cs2_ok else None, 0.3, 0.85,
-                       texture_lights=tex_lights or None, model_skins=vinfo.model_skins)
+                       texture_lights=tex_lights or None, model_skins=vinfo.model_skins,
+                       fullbright=fullbright)
         _summary(ctx, report)
         ctx.check()
 
