@@ -1988,6 +1988,32 @@ def _light_value(text):
     return 255.0 if parts and _float(parts[0]) is not None else None
 
 
+FULLBRIGHT_SUN_NAME = "cs2porter_fullbright_sun"
+
+
+def add_fullbright_sun(root):
+    """A map without baked light (lighting.fullbright_map) has nothing for the light probes to
+    bake, so weapons and players come out black in CS2: it gets a light_environment shining
+    straight down (its world materials are unlit, so only moving objects see it). Maps that
+    have a light_environment are left alone. Returns True when one was added."""
+    ents = root.children("entity")
+    if any(e.classname == "light_environment" for e in ents):
+        return False
+    spawn = next((e.get("origin") for e in ents if e.classname.startswith("info_player_") and e.get("origin")), None)
+    max_id = max([_max_solid_id(root)] + [int(e.get("id", "0")) for e in ents if (e.get("id") or "").isdigit()])
+    ent = VNode("entity")
+    # brightness 400 / ambient 40 become CS2 brightness 1 and sky intensity 1 (collect_lights)
+    ent.items = [["id", str(max_id + 1)], ["classname", "light_environment"],
+                 # Hammer keeps the pitch key and the pitch of the angles the same (-90 is down)
+                 ["targetname", FULLBRIGHT_SUN_NAME], ["angles", "-90 0 0"], ["pitch", "-90"],
+                 ["_light", "255 255 255 400"], ["_ambient", "255 255 255 40"],
+                 ["_lightHDR", "-1 -1 -1 1"], ["_ambientHDR", "-1 -1 -1 1"], ["origin", spawn or "0 0 0"]]
+    insert_at = next((n for n, i in enumerate(root.items) if isinstance(i, VNode)
+                      and i.name.lower() in ("cameras", "cordon")), len(root.items))
+    root.items.insert(insert_at, ent)
+    return True
+
+
 def _round2(v):
     return f"{round(v, 2):g}"
 

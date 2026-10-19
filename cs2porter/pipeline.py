@@ -1657,6 +1657,11 @@ def port_map(cfg, ctx, input_path, addon_name):
     # the 3D skybox room becomes a map of its own (before the light setup: the light probe
     # volumes and white rooms are only planned for what is left)
     sky3d = _split_sky3d(ctx, opts, root, None if is_vmf else info, tracer, map_name)
+    # a map without baked light was drawn fully bright in Source 1 (its world materials become
+    # unlit later); a sun straight down gives its light probes light for weapons and players
+    fullbright = not is_vmf and lightingmod.fullbright_map(info)
+    if fullbright and vmfmod.add_fullbright_sun(root):
+        ctx.detail(t("d_fullbright_sun"))
     lights, vis_bounds, light_rooms = _light_setup(ctx, opts, root, None if is_vmf else info, tracer)
     if sky3d:
         sky3d.lights = _lights_of(ctx, opts, sky3d.root, info, tracer)
@@ -1781,8 +1786,6 @@ def port_map(cfg, ctx, input_path, addon_name):
         # --- 5) missing assets ---------------------------------------------------------
         if os.path.isdir(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
-        # a map without baked light was drawn fully bright in Source 1
-        fullbright = not is_vmf and lightingmod.fullbright_map(info)
         if fullbright:
             ctx.log(t("p_fullbright"), "info")
         convert_assets(cfg, ctx, report, sources, materials, models,
@@ -1817,6 +1820,7 @@ def port_map(cfg, ctx, input_path, addon_name):
                                effects=effects, cable_missing=cable_missing, vis_bounds=vis_bounds,
                                light_rooms=light_rooms, particle_names=particle_names,
                                sprite_textures=report.sprite_textures, decals=decals, decimals=decimals,
+                               no_shadows=fullbright,
                                skybox_ref=f"maps/{sky3d.name}.vmap" if sky3d and sky3d.imported else None)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
             if sky3d and sky3d.imported:
