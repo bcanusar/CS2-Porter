@@ -1690,6 +1690,7 @@ def port_map(cfg, ctx, input_path, addon_name):
                            log=ctx.log if r is root else None, bhop_blocks=blocks, world=tracer,
                            strip_key=vmapmod.STRIP_KEY if bhop_on else None)
     del tracer
+    decimals = vmfmod.decimal_values(roots)
     vmfmod.write_vmf(root, vmf_path)
     if sky3d:
         vmfmod.write_vmf(sky3d.root, os.path.join(os.path.dirname(vmf_path), f"{sky3d.name}.vmf"))
@@ -1815,7 +1816,7 @@ def port_map(cfg, ctx, input_path, addon_name):
                                uv_sizes=uvfix.TextureSizes(content_dir),
                                effects=effects, cable_missing=cable_missing, vis_bounds=vis_bounds,
                                light_rooms=light_rooms, particle_names=particle_names,
-                               sprite_textures=report.sprite_textures, decals=decals,
+                               sprite_textures=report.sprite_textures, decals=decals, decimals=decimals,
                                skybox_ref=f"maps/{sky3d.name}.vmap" if sky3d and sky3d.imported else None)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
             if sky3d and sky3d.imported:

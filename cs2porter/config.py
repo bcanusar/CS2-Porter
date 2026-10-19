@@ -184,6 +184,7 @@ def resource_roots(folders, depth=3):
 BHOP_SCRIPT_PAGE = "https://steamcommunity.com/sharedfiles/filedetails/?id=3775382649"
 AUTHOR_PAGE = "https://steamcommunity.com/id/tehlikeli91/"
 DONATE_PAGE = "https://steamcommunity.com/tradeoffer/new/?partner=1538890593&token=F7uoB0t0"
+SPONSOR_PAGE = "https://github.com/sponsors/bcanusar"
 YOUTUBE_PAGE = "https://www.youtube.com/@burak.016"
 GITHUB_PAGE = "https://github.com/bcanusar"
 

@@ -316,7 +316,26 @@ class Dialog:
         except tk.TclError:
             pass
         first.focus_set()
+        # shown while the program was in the background or minimized: Windows keeps the box
+        # behind (or hidden with the minimized window), so it comes up whenever the main window
+        # is clicked or restored
+        def front(_e=None):
+            if top.winfo_exists():
+                top.deiconify()
+                top.lift()
+                first.focus_force()
+
+        if parent.state() != "iconic":
+            top.after(50, front)
+        bound = [(seq, parent.bind(seq, front, add="+")) for seq in ("<FocusIn>", "<Map>")]
         parent.wait_window(top)
+        for seq, fid in bound:
+            try:
+                script = parent.bind(seq) or ""
+                parent.bind(seq, "\n".join(x for x in script.split("\n") if x.strip() and fid not in x))
+                parent.deletecommand(fid)
+            except tk.TclError:
+                pass
 
     def _close(self, key):
         self.result = key
@@ -3393,10 +3412,14 @@ class App:
 
         ttk.Label(card, text=t("about_thanks"), style="AboutMuted.TLabel", wraplength=int(250 * self._scale),
                   justify="left").pack(anchor="w", pady=(12, 6))
-        donate = ttk.Button(card, text=t("about_donate"), style="Accent.TButton",
-                            command=lambda: webbrowser.open(config.DONATE_PAGE))
-        donate.pack(anchor="w", fill="x")
-        ToolTip(donate, t("about_donate_tip"))
+        # two ways to donate: an item through a Steam trade offer, or GitHub Sponsors
+        for i, (icon, color, style, key, url) in enumerate((
+                ("steam", ON_ACCENT, "Accent.TButton", "about_donate_steam", config.DONATE_PAGE),
+                ("github", FG, "Action.TButton", "about_donate_github", config.SPONSOR_PAGE))):
+            b = ttk.Button(card, text=" " + t(key), style=style, image=self._about_image(icon, 16, color),
+                           compound="left", command=lambda u=url: webbrowser.open(u))
+            b.pack(anchor="w", fill="x", pady=(6 if i else 0, 0))
+            ToolTip(b, t(key + "_tip"))
 
         social = ttk.Frame(card, style="About.TFrame")
         social.pack(anchor="w", pady=(12, 0))

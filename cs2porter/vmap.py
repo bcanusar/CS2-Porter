@@ -54,7 +54,7 @@ class Fixes:
                  ropes=None, ambients=None, water=None, commands=False, uv_sizes=None,
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
                  surface_lights=None, underwater=None, sprite_textures=None, decals=None,
-                 skybox_ref=None, sky_map=None):
+                 skybox_ref=None, sky_map=None, decimals=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
         self.occluder_vmat = occluder_vmat  # material for the sky brushes (None: tools/toolsskybox)
@@ -89,6 +89,8 @@ class Fixes:
         self.renames = []
         # infodecals and the faces they sit on (vmf.decal_surfaces)
         self.decals = decals or []
+        # (key, "%f" text) -> the value the VMF had (vmf.decimal_values)
+        self.decimals = decimals or {}
         # main map of a 3D skybox: the skybox map its skybox_reference shows ('maps/x.vmap')
         self.skybox_ref = skybox_ref
         # the skybox map itself: {"offset": moves the sky_camera onto the origin, "box": (mins,
@@ -234,6 +236,24 @@ def strip_plus(text):
     if "/+" not in text:
         return text, 0
     text = _PLUS_RE.sub(repl, text)
+    return text, count[0]
+
+
+_UNSAFE_MAT_RE = re.compile(r'"(materials/[^"]*[ ()\'!][^"]*\.vmat)"')
+
+
+def safe_material_paths(text):
+    """Material paths with a space, ( ) ' or ! get the name the converted material has
+    (materials.out_name). The importer renames them on faces but not on static overlays
+    ("badges/comj2_graff (4)" stayed, the file is comj2_graff__4_.vmat). Returns (text, count)."""
+    from .materials import _IMPORT_UNSAFE
+    count = [0]
+
+    def repl(m):
+        count[0] += 1
+        return '"' + m.group(1).translate(_IMPORT_UNSAFE) + '"'
+
+    text = _UNSAFE_MAT_RE.sub(repl, text)
     return text, count[0]
 
 
@@ -1160,7 +1180,28 @@ def set_particle_names(text, names):
     return _EFFECT_NAME_RE.sub(fn, text), count
 
 
+_DECIMAL_VALUE_RE = re.compile(r'^([ \t]*"([^"]+)" "string" ")(-?\d+\.\d{6})"', re.M)
+
+
+def restore_decimals(text, decimals):
+    """Puts back entity values the importer rewrote as "%f" ("1.01" -> "1.010000"): names
+    like that must stay as the outputs and teleports that point at them spell them."""
+    count = 0
+
+    def repl(m):
+        nonlocal count
+        old = decimals.get((m.group(2).lower(), m.group(3)))
+        if old is None:
+            return m.group(0)
+        count += 1
+        return f'{m.group(1)}{old}"'
+    return _DECIMAL_VALUE_RE.sub(repl, text), count
+
+
 def _edit_text(text, fx, table, stats):
+    if fx.decimals:
+        text, n = restore_decimals(text, fx.decimals)
+        stats["decimals"] = stats.get("decimals", 0) + n
     if fx.sky_alias:
         text, n = replace_sky(text, fx.sky_alias, fx.occluder_vmat or TOOLS_SKY_VMAT)
         stats["sky"] += n
@@ -1186,6 +1227,8 @@ def _edit_text(text, fx, table, stats):
     text = _VPOST_RE.sub(r"postprocess/\1", text)
     text, n = strip_plus(text)
     stats["plus"] += n
+    text, n = safe_material_paths(text)
+    stats["unsafe_paths"] = stats.get("unsafe_paths", 0) + n
     if fx.particle_names and '"effect_name"' in text:
         text, n = set_particle_names(text, fx.particle_names)
         stats["particle_names"] = stats.get("particle_names", 0) + n

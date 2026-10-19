@@ -2962,6 +2962,31 @@ def _remove_empty_brush_entities(root):
     return before - len(root.items)
 
 
+_DECIMAL_RE = re.compile(r"-?(?:\d+\.\d*|\.\d+)")
+
+
+def decimal_values(roots):
+    """Entity values written as decimal numbers ("1.01"). The importer stores them as "%f"
+    ("1.010000"), so a targetname "1.01" no longer matches the outputs that still say "1.01".
+    Returns {(key, "%f" text): original text} to put the original back in the .vmap."""
+    found = {}
+    for root in roots:
+        for ent in root.children("entity"):
+            for item in ent.items:
+                if not isinstance(item, list) or len(item) < 2:
+                    continue
+                value = str(item[1]).strip()
+                if not _DECIMAL_RE.fullmatch(value):
+                    continue
+                try:
+                    text = f"{float(value):f}"
+                except ValueError:
+                    continue
+                if text != value:
+                    found.setdefault((str(item[0]).lower(), text), value)
+    return found
+
+
 # radius of assets/glow_particle.vpcf at scale 1
 LIGHTGLOW_RADIUS = 48.0
 
@@ -2971,6 +2996,43 @@ def _sprite_alpha(ent):
     glow alpha 0."""
     if ent.get("renderamt") is None:
         ent.set("renderamt", "255")
+
+
+_AXIS_SCALE_RE = re.compile(r"^(.*\]\s*)(-?\d+\.\d{4})\s*$")
+SCALE_GRID = 2048.0
+
+
+def _snap_texture_scales(root):
+    """Texture scales written with 4 decimals (the decompiler rounds 0.046875 to 0.0469) that
+    are that close to a multiple of 1/2048 get the exact value: far from the origin the rounded
+    one moves the texture (2 units at x = 4000 for 0.0469). Returns the number of values."""
+    count = 0
+
+    def sides(node):
+        nonlocal count
+        for solid in node.children("solid"):
+            for side in solid.children("side"):
+                for key in ("uaxis", "vaxis"):
+                    m = _AXIS_SCALE_RE.match(side.get(key) or "")
+                    if not m:
+                        continue
+                    v = float(m.group(2))
+                    exact = round(v * SCALE_GRID) / SCALE_GRID
+                    if exact and abs(exact - v) <= 5.01e-5 and exact != v:
+                        side.set(key, f"{m.group(1)}{exact:g}")
+                        count += 1
+        for hidden in node.children("hidden"):
+            sides(hidden)
+
+    world = root.child("world")
+    if world is not None:
+        sides(world)
+    for ent in root.children("entity"):
+        sides(ent)
+    for hidden in root.children("hidden"):
+        for ent in hidden.children("entity"):
+            sides(ent)
+    return count
 
 
 def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key=None,
@@ -2992,6 +3054,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
              "floor": 0, "effects": 0, "removed": 0, "bhop_blocks": 0, "flag_triggers": 0, "trigger_clip": 0,
              "cubemaps": 0, "zones": 0, "spawns": 0, "nonsolid": 0, "landmarks": 0, "int_keys": 0, "empty": 0, "lifted": 0}
     _fix_base(root)
+    stats["tex_scales"] = _snap_texture_scales(root)
     stats["removed"] = _remove_classes(root)
     stats["cubemaps"] = _remove_classes(root, CUBEMAP_CLASSES)
     stats["empty"] = _remove_empty_brush_entities(root)

@@ -165,9 +165,12 @@ def build_stub_game(work_dir, sources, materials, skyname="", aliases=None, size
             # it gets the VMT with the included values filled in
             written_vmt.add(rel)
             put(rel, _flat_vmt(vmt) if _is_patch(data) else data)
-        for key in _TEX_KEYS:
-            val = vmt.get(key)
-            if not val:
+        # the importer (like the Source 1 compiler) sizes faces by the texture of the top block,
+        # not the ">dx90" one the game draws (courtyard_center: _1024 on top, _2048 in ">dx90";
+        # without a _1024 stub the faces came out sized by a 64 wide stand-in)
+        top = {k.lower(): v for k, v in vmt.block.values()} if vmt.block is not None else {}
+        for val in [vmt.get(key) for key in _TEX_KEYS] + [top.get(key) for key in _TEX_KEYS]:
+            if not val or not isinstance(val, str):
                 continue
             tex = norm_tex(val)
             if not tex or tex in written_tex:

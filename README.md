@@ -20,21 +20,22 @@ you. CS2 Porter goes further:
 
 | Area | What CS2 Porter does |
 |---|---|
-| Many maps at once | A list of maps, each into its own addon or a shared one. Two maps are ported at a time and the next starts as soon as one ends. Maps can come as `.bsp`, `.vmf` or inside `.zip`, `.rar` and `.7z` archives. |
-| Finding assets | Looks for every material, model, sound and particle in the map's own packed files, in every installed Source 1 game (folders and VPKs) and in your own resource folders. Materials the map forgot to pack are taken from the copy the map compiler left inside the map. |
+| Many maps at once | A list of maps, each into its own addon or a shared one. Two maps are ported at a time and the next starts as soon as one ends. Maps can come as `.bsp`, `.vmf`, `.bsp.bz2` or inside `.zip`, `.rar` and `.7z` archives. |
+| Finding assets | Looks for every material, model, sound and particle in the map's own packed files, in every installed Source 1 game (folders and VPKs) and in your own resource folders. Maps placed in a resource folder are read as packages too, so files another map packed can fill the gaps. Materials the map forgot to pack are taken from the copy the map compiler left inside the map, and damaged packed files are recovered when a good copy exists. |
 | Models | Its own model decompiler turns `.mdl` files into CS2 models with their physics, skins and correct orientation; animated models keep their animations. |
-| Materials | Translucency, alpha test, self illumination, additive glow, scrolling and animated textures (turned into sprite sheets), blend materials, water and refracting glass are converted to their CS2 shaders. Texture scales on brushes are corrected. |
-| Lighting | Light brightness is measured against the Source 1 falloff and matched in lumens, the sun and sky keep their strength, and materials that gave light in Source 1 (texture lights) glow and light the map again. Light probe volumes are added for the whole map. |
+| Materials | Translucency, alpha test, self illumination, additive glow, color tints, scrolling and animated textures (turned into sprite sheets), blend materials, graffiti decals, wireframe materials, water and refracting glass are converted to their CS2 shaders. Textures that fade out with distance in Source 1 fade out in CS2 too. Texture scales and positions on brushes are corrected. |
+| Lighting | Light brightness is measured against the Source 1 falloff and matched in lumens, the sun and sky keep their strength, and materials that gave light in Source 1 (texture lights) glow and light the map again. Dynamic lights become baked lights, lights CS2 would not bake are moved to a spot where they do, and maps that had no baked light stay fully bright. Light probe volumes are added for the whole map. |
 | Displacements | Blend displacements keep their texture blending. |
-| Effects | The map's particle systems are converted, and sprites, beams, spotlights, dust, smoke, embers and fire become CS2 particle effects. Ropes become cables that sag like they did in Source 1. |
-| Sky | 2D skyboxes and skies drawn from cube textures become a CS2 sky, with sky brushes that show it. |
+| Effects | The map's particle systems are converted, and sprites, glows, beams and lasers, sparks, tesla arcs, smoke stacks, smoke volumes, spotlights, dust, embers and fire become CS2 particle effects. Ropes become cables that sag like they did in Source 1. |
+| Sky | 2D skyboxes and skies drawn from cube textures become a CS2 sky, with sky brushes that show it. The 3D skybox becomes its own skybox map, and the map's sun is drawn into the sky. |
 | Post processing | The map's color correction becomes CS2 post processing, and water gets an underwater look that follows the shape of the water. |
 | Sound | Ambient sounds and soundscapes become CS2 sound events with the same range and fade. |
-| Map fixes | Decals are put back onto their surfaces, clip brushes are rebuilt from the `.bsp`, entities CS2 does not have are converted or removed, and unknown keys are cleaned up. |
+| Map fixes | Decals are put back onto their surfaces, clip brushes are rebuilt from the `.bsp`, entities CS2 does not have are converted or removed, and unknown keys are cleaned up. Thin boost and gravity triggers are made thick enough to work, spawn points stuck in the floor are lifted, empty brush entities are removed, and entity names like `1.01` keep their exact text. |
 | Missing assets | Lists what a ported map (and the models in its addon) still misses, searches for it in your games and adds it to the addon. A model whose material exists nowhere can get a placeholder material, so it still compiles. |
-| Tools | Converters for single files and folders: materials, models, images, translucency masks, skyboxes, and Polyhaven / Megascans models, plants and textures. |
+| Addons | Lists your CS2 addons with their maps, size and last change; opens or deletes them (to the Recycle Bin). |
+| Tools | Converters for single files and folders: materials, models, images, translucency masks, skyboxes (from six faces or one open cube image), and Polyhaven / Megascans models, plants and textures. |
 | Report | Every port writes a full `report.txt`: each step, every file and where it came from, and what could not be found. |
-| Comfort | English, Turkish, Russian and Chinese, dark and light theme, drag and drop everywhere, and updates from inside the program. |
+| Comfort | English, Turkish, Russian and Chinese, dark and light theme, drag and drop and copy / paste everywhere, and updates from inside the program. |
 
 ## Requirements
 
@@ -76,6 +77,7 @@ Other tabs:
   it with the files it needs.
 - **Tools**: converts single files or folders (materials, models, images, skyboxes, Polyhaven and
   Megascans assets).
+- **Addons**: lists your CS2 addons, opens their folders or deletes them.
 - **Settings**: language, theme, the CS2 folder, extra folders with Source 1 files, and the
   port options.
 
@@ -104,10 +106,14 @@ not change CS2's own game files.
 
 ## Internet use
 
-Only one thing goes online: when the "bhop script" option is on and the map needs it, the
-program downloads the newest version of the bhop script with one HTTPS request and keeps a copy.
-Without a connection the saved copy, or the copy built into the program, is used. Turn off
-"Download the newest bhop script" in Settings to stay fully offline.
+Two things go online, each with plain HTTPS requests:
+
+- At start, the program asks GitHub whether a newer release exists. Nothing is downloaded unless
+  you agree to the update. Without a connection the check is skipped silently.
+- When the "bhop script" option is on and the map needs it, the program downloads the newest
+  version of the bhop script and keeps a copy. Without a connection the saved copy, or the copy
+  built into the program, is used. Turn off "Download the newest bhop script" in Settings to
+  skip this.
 
 ## Troubleshooting
 
@@ -135,6 +141,12 @@ party tools: put BSPSource (and optionally VTFCmd) into `tools` as `tools\README
 Put the tools into `tools` (see `tools\README.md`), then run `build.bat`. The first run makes a
 `.venv` and installs the build requirements. It writes `build\dist\CS2 Porter.exe` and
 `release\CS2-Porter-<version>.zip` with the program, the tools and their licenses.
+
+## Support
+
+If CS2 Porter helped you, you can support it by
+[sending an item on Steam](https://steamcommunity.com/tradeoffer/new/?partner=1538890593&token=F7uoB0t0)
+or through [GitHub Sponsors](https://github.com/sponsors/bcanusar).
 
 ## Legal
 
