@@ -1013,6 +1013,35 @@ class MaterialConverter:
         self.log(t("d_sheet", tex=res, n=n, cols=cols, rows=rows), "tool")
         return res, n, cols, rows
 
+    def ensure_frame(self, tex, frame):
+        """Frame `frame` of an animated VTF as a texture of its own ('materials/..._frameN.tga'), for a
+        material that shows one fixed $frame. None when the texture has no such frame."""
+        tex = norm_tex(tex)
+        key = f"{tex}#{frame}"
+        if key in self.tex_cache:
+            return self.tex_cache[key]
+        res = f"materials/{out_name(tex)}_frame{frame}.tga"
+        out = self._abs(res)
+        if not self.overwrite and os.path.isfile(out):
+            self.tex_cache[key] = res
+            return res
+        src, rel, ext = self.sources.find_texture(tex)
+        result = None
+        if src is not None and ext == ".vtf":
+            try:
+                data = src.read(rel)
+                if vtfmod.read_header(data).frames > frame:
+                    img = vtfmod.load_vtf_frames(data)[0][frame]
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    img.save(out)
+                    _make_pow2(out)
+                    result = res
+                    self.log(t("d_texture", tex=res, src=getattr(src, "label", "")), "tool")
+            except Exception as e:  # noqa: BLE001
+                self.log(t("m_tex_fail", tex=tex, e=e), "warn")
+        self.tex_cache[key] = result
+        return result
+
     # --- translucency ---------------------------------------------------------------
     @staticmethod
     def _alpha_used(abs_path):
@@ -1147,7 +1176,9 @@ class MaterialConverter:
             color = sheet[0]
             vmt.anim = (sheet[1], sheet[2], sheet[3], 1.0 / rate)
         else:
-            color = self.ensure_texture(base)
+            # a fixed $frame of an animated texture (a clock digit ...) shows that frame
+            frame = int((_floats(vmt.get("$frame")) + [0])[0])
+            color = (self.ensure_frame(base, frame) if frame > 0 else None) or self.ensure_texture(base)
         if not color:
             return MaterialResult(mat, "missing", t("m_tex_missing", tex=norm_tex(base)), src.label)
 
@@ -1517,7 +1548,9 @@ class MaterialConverter:
                     or (("overlay" in usages or "decal" in usages) and not on_brush)
                     or ((vmt.flag("$decal") or VC._keyword_hit(lower, "decal")) and not on_brush))
         is_glass = VC._keyword_hit(lower, "glass")
-        is_unlit = shader in _UNLIT_SHADERS or (
+        if is_glass and not vmt.get("$surfaceprop"):
+            sysattr = VC.build_system_attributes("glass")
+        is_unlit =shader in _UNLIT_SHADERS or (
             self.fullbright and on_brush and (shader.startswith("lightmapped") or shader == "worldvertextransition"))
         is_model = "model" in usages
         is_foliage = is_model and (surface == "foliage" or any(any(s.startswith(k) for k in _FOLIAGE_KW) for s in segs))
@@ -1566,7 +1599,7 @@ class MaterialConverter:
             # Source 1 only blends a world or model material when its VMT asks for it
             # ($translucent / $alphatest); decals and foliage go by their alpha
             transparent, trans = self._translucency(color, vmt, decide_by_pixels=is_foliage or is_decal)
-            if vmt.flag("$additive") and not (is_unlit or is_decal or is_foliage or is_glass):
+            if vmt.flag("$additive") and not (is_unlit or is_decal or is_foliage):
                 # a lit $additive surface (laser beams, light shafts) adds its texture to what
                 # is behind it: it becomes a translucent layer, as opaque as it is bright
                 tint = list(vmt_color(vmt) or (1.0, 1.0, 1.0)) if not _proxy_writes(vmt, "$color") else [1.0] * 3
@@ -1594,16 +1627,23 @@ class MaterialConverter:
                 # the CS2 wind animation moves the whole converted model far too much
                 content = build_vmat_foliage(slot, "").replace("F_FOLIAGE_ANIMATION 1", "F_FOLIAGE_ANIMATION 0")
                 tag = "foliage"
-            elif is_glass:
-                if transparent and trans:
-                    content = VC.TMPL_GLASS_TRANSLUCENT.format(color=color, transculent=trans)
-                    tag = "glass + translucent"
-                else:
-                    content = VC.TMPL_GLASS_OPAQUE.format(color=color)
-                    tag = "glass (opaque)"
+            elif is_glass and transparent and trans:
+                # (a "glass" material that does not ask for blending is opaque in Source 1 too:
+                # it is converted like any other material below)
+                content = VC.TMPL_GLASS_TRANSLUCENT.format(color=color, transculent=trans)
+                tag = "glass + translucent"
             elif is_decal:
+                additive = None
+                if vmt.flag("$additive") and shader != "decalmodulate":
+                    # an additive decal (a glow spot) adds its texture to the wall: black shows
+                    # nothing, so it becomes a translucent layer as opaque as it is bright
+                    tint = list(vmt_color(vmt) or (1.0, 1.0, 1.0)) if not _proxy_writes(vmt, "$color") else [1.0] * 3
+                    additive = self._additive_layers(color, trans if transparent else None, tint)
                 layers = self._modulate_layers(color) if shader == "decalmodulate" else None
-                if layers:
+                if additive:
+                    content = VC.TMPL_DECAL_TRANSLUCENT.format(color=additive[0], transculent=additive[1])
+                    tag = "decal + additive"
+                elif layers:
                     content = VC.TMPL_DECAL_TRANSLUCENT.format(color=layers[0], transculent=layers[1])
                     tag = "decal + modulate"
                 elif transparent and trans:

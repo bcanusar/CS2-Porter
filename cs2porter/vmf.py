@@ -749,6 +749,54 @@ def _fix_dynamic_prop(ent):
     return True
 
 
+# Source 1 prop_dynamic inputs CS2 does not have -> the CS2 input that plays the same way
+# (SetAnimation plays the sequence once and goes back to the idle animation)
+ANIMATION_INPUTS = {"setanimation": "SetAnimationNotLooping",
+                    "setanimationnoreset": "SetAnimationNoResetNotLooping",
+                    "setdefaultanimation": "SetIdleAnimationNotLooping"}
+_DYNAMIC_PROP_CLASSES = ("prop_dynamic", "prop_dynamic_glow", "prop_dynamic_override", "prop_dynamic_ornament")
+
+
+def _animation_inputs(root):
+    """Outputs that send a Source 1 animation input to a prop_dynamic get the CS2 one.
+    Returns the number of outputs changed."""
+    names = {(e.get("targetname") or "").strip().lower() for e in root.children("entity")
+             if e.classname in _DYNAMIC_PROP_CLASSES} - {""}
+    if not names:
+        return 0
+    count = 0
+    for ent in root.children("entity"):
+        for conn in ent.children("connections"):
+            for item in conn.items:
+                if not isinstance(item, list) or len(item) < 2:
+                    continue
+                sep = "\x1b" if "\x1b" in item[1] else ","
+                parts = item[1].split(sep)
+                if len(parts) < 2:
+                    continue
+                target = parts[0].strip().lower()
+                if not (target in names or target.endswith("*") and any(n.startswith(target[:-1]) for n in names)):
+                    continue
+                new = ANIMATION_INPUTS.get(parts[1].strip().lower())
+                if new:
+                    parts[1] = new
+                    item[1] = sep.join(parts)
+                    count += 1
+    return count
+
+
+def _idle_material_controls(root):
+    """Removes material_modify_control entities that no output sends anything to: CS2 has no such
+    entity, and without inputs it changed nothing in Source 1 either (the material keeps its own
+    $frame, see materials). Returns the number removed."""
+    refs = _referenced_names(root)
+    before = len(root.items)
+    root.items = [i for i in root.items
+                  if not (isinstance(i, VNode) and i.name.lower() == "entity" and i.classname == "material_modify_control"
+                          and not _is_referenced(i.get("targetname") or "", refs))]
+    return before - len(root.items)
+
+
 def _is_skip_or_hint(mat):
     m = mat.lower().replace("\\", "/")
     return m in ("tools/toolsskip", "tools/toolshint")
@@ -821,7 +869,35 @@ def _swap_sky_material(root, alias, mats=SKYBOX_MATS):
     return count
 
 
-LADDER_MATS = ("tools/toolsinvisibleladder", "tools/toolsinvisibleladder_wood")
+def add_sky_clips(root):
+    """The sky occluder has no collision in CS2: every world / func_detail brush with a sky face
+    gets a player clip copy in the same place. Returns the number of copies."""
+    max_id = _max_solid_id(root)
+    count = 0
+    owners = [root.child("world")] + [e for e in root.children("entity") if e.classname == "func_detail"]
+    for owner in owners:
+        if owner is None:
+            continue
+        copies = []
+        for solid in owner.children("solid"):
+            if not any(normalize_material(s.get("material", "")) in SKYBOX_MATS for s in solid.children("side")):
+                continue
+            clip = _copy_node(solid)
+            clip.items = [i for i in clip.items if not (isinstance(i, VNode) and i.name.lower() == "editor")]
+            max_id += 1
+            clip.set("id", str(max_id))
+            for side in clip.children("side"):
+                side.items = [i for i in side.items if not (isinstance(i, VNode) and i.name.lower() in ("vertices_plus", "dispinfo"))]
+                max_id += 1
+                side.set("id", str(max_id))
+                side.set("material", PLAYERCLIP_MAT)
+            copies.append(clip)
+        owner.items += copies
+        count += len(copies)
+    return count
+
+
+LADDER_MATS =("tools/toolsinvisibleladder", "tools/toolsinvisibleladder_wood")
 
 
 def _ladders_to_world(root):
@@ -1364,6 +1440,62 @@ def _max_solid_id(root):
             except ValueError:
                 pass
     return max_id
+
+
+# an info_overlay without faces is kept when a brush is at most this far from its origin
+OVERLAY_REACH = 4
+
+
+def _faceless_overlays(root):
+    """Removes the info_overlays that have no faces and no brush near them: Source 1 drew an
+    overlay only on its faces, so these were never seen, but CS2 shows them in the air.
+    Overlays without faces that sit on a brush (the decompiler lost their faces) stay.
+    Returns the number removed."""
+    lost = [e for e in root.children("entity")
+            if e.classname == "info_overlay" and not (e.get("sides") or "").strip()]
+    if not lost:
+        return 0
+    boxes = []
+    for node in _walk(root):
+        if node.name.lower() != "solid":
+            continue
+        pts = [p for side in node.children("side")
+               for p in (tuple(_float(v) for v in m.split()) for m in re.findall(r"\(([^)]*)\)", side.get("plane", "")))
+               if len(p) == 3 and None not in p]
+        if pts:
+            boxes.append((tuple(min(p[k] for p in pts) for k in range(3)),
+                          tuple(max(p[k] for p in pts) for k in range(3))))
+    drop = set()
+    for ent in lost:
+        o = [_float(v) for v in (ent.get("origin") or "").split()]
+        if len(o) != 3 or None in o:
+            continue
+        if not any(all(lo[k] - OVERLAY_REACH <= o[k] <= hi[k] + OVERLAY_REACH for k in range(3)) for lo, hi in boxes):
+            drop.add(id(ent))
+    root.items = [i for i in root.items if id(i) not in drop]
+    return len(drop)
+
+
+# trigger_push brushes at most this thick (on their thinnest axis) are boost pads
+PUSH_PAD_MAX = 16
+
+
+def _push_pads_on_start_touch(root):
+    """Source 1 trigger_push sets the player's base velocity while touching it, and the player
+    keeps that speed once on leaving; CS2 adds the push to the velocity on every tick inside,
+    so a pad gives many times the speed. Thin push triggers (pads) push on start touch only.
+    Returns the number changed."""
+    count = 0
+    for ent in root.children("entity"):
+        if ent.classname != "trigger_push" or ent.index_of_key("triggeronstarttouch") != -1:
+            continue
+        boxes = [b for b in (_box_bounds(s) for s in ent.children("solid")) if b]
+        if not boxes or len(boxes) != len(ent.children("solid")):
+            continue
+        if all(min(hi[k] - lo[k] for k in range(3)) <= PUSH_PAD_MAX for lo, hi in boxes):
+            ent.set("triggeronstarttouch", "1")
+            count += 1
+    return count
 
 
 def _raise_boost_triggers(root):
@@ -3093,6 +3225,10 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["ladders"] = _ladders_to_world(root)
     stats["trigger_clip"] = _world_triggers_to_clip(root)
     stats["booster"] = _remove_booster_filter(root)
+    stats["push_pads"] = _push_pads_on_start_touch(root)
+    stats["anim_inputs"] = _animation_inputs(root)
+    stats["material_controls"] = _idle_material_controls(root)
+    stats["overlays"] = _faceless_overlays(root)
     if bhop_blocks and teleport_key:
         stats["bhop_blocks"], stats["flag_triggers"] = _bhop_blocks(root, teleport_key)
     stats["filters"] = _name_filters_to_attribute(root, attributes if attributes is not None else {})
@@ -3182,7 +3318,8 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "particles", "physbox", "skiphint_removed", "skiphint_replaced", "skybox", "ladders",
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
-                  "landmarks", "weaponstrip", "beam_sparks", "int_keys", "empty", "lifted"):
+                  "landmarks", "weaponstrip", "beam_sparks", "int_keys", "empty", "lifted", "push_pads",
+                  "anim_inputs", "material_controls", "overlays"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

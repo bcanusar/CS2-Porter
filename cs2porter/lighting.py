@@ -48,6 +48,9 @@ TRACE_DIST = 4096.0
 NEAR = 48.0
 MIN_HITS = 8
 CAP = 4.0
+# a map compiled without HDR light is drawn from 8 bit lightmaps that hold at most 2 x full
+# brightness (the overbright factor): any brighter Source 1 light looked the same as that
+CAP_LDR = 2.0
 # distances used when the map geometry is not known (a .vmf input)
 DEFAULT_DISTANCES = (128.0, 256.0, 384.0)
 
@@ -383,16 +386,16 @@ def source1_light(light, color, d):
     return max(light["intensity"]) / att / max(peak, 1e-3)
 
 
-def match_lumens(light, color, distances):
+def match_lumens(light, color, distances, cap=CAP):
     """(lumens, range) of a CS2 light that gives the surfaces at the distances the same light as
-    the Source 1 light."""
+    the Source 1 light (counted up to cap)."""
     hits = [d for d in distances if d is not None]
     use = [d for d in hits if d >= NEAR]
     if len(use) < MIN_HITS:
         use = [max(d, 16.0) for d in hits] or list(DEFAULT_DISTANCES)
     logs = []
     for d in use:
-        s = min(source1_light(light, color, d), CAP)
+        s = min(source1_light(light, color, d), cap)
         if s > 0:
             logs.append(math.log(s * d * d))
     if not logs:
@@ -409,6 +412,7 @@ def light_values(root, info=None, tracer=None):
     """{position: {"lumens", "range"}} for the point and spot lights of the VMF.
     info: the .bsp (BSPInfo) when the map is ported from one."""
     compiled = world_lights(info) if info is not None else {}
+    cap = CAP_LDR if info is not None and info.lumps[LUMP_LIGHTING_HDR][1] <= 0 else CAP
     out = {}
     for ent in root.children("entity"):
         if ent.classname not in ("light", "light_spot", "light_dynamic"):
@@ -425,7 +429,7 @@ def light_values(root, info=None, tracer=None):
             dists = tracer.trace_all(pos, _directions(light))
         else:
             dists = list(DEFAULT_DISTANCES)
-        res = match_lumens(light, color, dists)
+        res = match_lumens(light, color, dists, cap)
         if res is None:
             continue
         lumens, rng = res

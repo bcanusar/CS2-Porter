@@ -244,6 +244,23 @@ class ToolTip:
             self.tip = None
 
 
+def wait_restored(parent):
+    """Waits until a minimized main window is restored. A box made while it is minimized is not
+    shown, but its grab still takes effect, and Tk then refuses to restore the main window: the
+    program could not be brought back from the taskbar."""
+    try:
+        if parent.state() != "iconic":
+            return
+        shown = tk.BooleanVar(parent, value=False)
+        fid = parent.bind("<Map>", lambda _e: shown.set(True), add="+")
+        parent.wait_variable(shown)
+        script = parent.bind("<Map>") or ""
+        parent.bind("<Map>", "\n".join(x for x in script.split("\n") if x.strip() and fid not in x))
+        parent.deletecommand(fid)
+    except tk.TclError:
+        pass
+
+
 class Dialog:
     """Message and yes / no boxes in the program's colors (the Windows ones are always white)."""
 
@@ -251,6 +268,7 @@ class Dialog:
 
     def __init__(self, parent, title, text, kind="info", buttons=("ok",), dark=True):
         self.result = None
+        wait_restored(parent)
         self.top = top = tk.Toplevel(parent)
         top.withdraw()
         top.title(title)
@@ -316,17 +334,15 @@ class Dialog:
         except tk.TclError:
             pass
         first.focus_set()
-        # shown while the program was in the background or minimized: Windows keeps the box
-        # behind (or hidden with the minimized window), so it comes up whenever the main window
-        # is clicked or restored
+        # shown while the program was in the background: Windows keeps the box behind, so it
+        # comes up whenever the main window is clicked or restored
         def front(_e=None):
             if top.winfo_exists():
                 top.deiconify()
                 top.lift()
                 first.focus_force()
 
-        if parent.state() != "iconic":
-            top.after(50, front)
+        top.after(50, front)
         bound = [(seq, parent.bind(seq, front, add="+")) for seq in ("<FocusIn>", "<Map>")]
         parent.wait_window(top)
         for seq, fid in bound:
@@ -353,6 +369,7 @@ class ChecklistDialog:
 
     def __init__(self, parent, title, text, rows, dark=True):
         self.result = None
+        wait_restored(parent)
         self.rows = rows
         self.top = top = tk.Toplevel(parent)
         top.withdraw()

@@ -1665,6 +1665,12 @@ def port_map(cfg, ctx, input_path, addon_name):
     lights, vis_bounds, light_rooms = _light_setup(ctx, opts, root, None if is_vmf else info, tracer)
     if sky3d:
         sky3d.lights = _lights_of(ctx, opts, sky3d.root, info, tracer)
+    if sky_alias and opts.get("sky_occluder", True):
+        # the sky occluder has no collision: player clip copies of the sky brushes (before the
+        # white rooms get theirs, those stay without)
+        clips = vmfmod.add_sky_clips(root)
+        if clips:
+            ctx.detail(t("d_sky_clips", n=clips))
     if light_rooms and sky_alias:
         # the white rooms are wrapped in sky brushes (occluder) so they look like the sky
         shells = vmfmod.add_room_shells(root, light_rooms, probesmod.ROOM_HALF, vmfmod.SKYBOX_MAT)
