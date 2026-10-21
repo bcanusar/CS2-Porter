@@ -1377,6 +1377,27 @@ def read_reference_file(path):
 # Map porting
 # ---------------------------------------------------------------------------
 
+def _start_anims(content_dir, models):
+    """{vmdl path lower: first animation} of the map's animated models in the addon (see
+    vmap.set_start_anims)."""
+    from .models import first_anim_name
+    out = {}
+    for mdl in models:
+        rel = mdl.replace("\\", "/").strip("/").lower()
+        if not rel.endswith(".mdl"):
+            continue
+        vmdl = rel[:-4] + ".vmdl"
+        try:
+            with open(os.path.join(content_dir, *vmdl.split("/")), encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        name = first_anim_name(text) if '_class = "AnimFile"' in text else None
+        if name:
+            out[vmdl] = name
+    return out
+
+
 def _tracer(info, root):
     """Line traces against the compiled map (None for a .vmf input or a broken .bsp)."""
     if info is None:
@@ -1826,7 +1847,7 @@ def port_map(cfg, ctx, input_path, addon_name):
                                effects=effects, cable_missing=cable_missing, vis_bounds=vis_bounds,
                                light_rooms=light_rooms, particle_names=particle_names,
                                sprite_textures=report.sprite_textures, decals=decals, decimals=decimals,
-                               no_shadows=fullbright,
+                               no_shadows=fullbright, start_anims=_start_anims(content_dir, models),
                                skybox_ref=f"maps/{sky3d.name}.vmap" if sky3d and sky3d.imported else None)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
             if sky3d and sky3d.imported:

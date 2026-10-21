@@ -2755,6 +2755,12 @@ class App:
         self.btn_addon_del.pack(side="left", padx=(8, 0))
         self.lbl_addons = ttk.Label(act, text="", style="CardMuted.TLabel")
         self.lbl_addons.pack(side="left", padx=12)
+        # search in the addon and map names
+        self.v_addon_find = tk.StringVar()
+        find = ttk.Entry(act, textvariable=self.v_addon_find, width=28)
+        find.pack(side="right")
+        ttk.Label(act, text=t("table_search"), style="Card.TLabel").pack(side="right", padx=(0, 6))
+        self.v_addon_find.trace_add("write", lambda *a: self._fill_addons(self.addon_tree.selection()))
         wrap = ttk.Frame(tab, style="Card.TFrame")
         wrap.pack(fill="both", expand=True, padx=16, pady=(0, 8))
         cols = ("name", "maps", "size", "date")
@@ -2816,7 +2822,13 @@ class App:
         col, rev = self._addon_sort
         key = {"name": lambda r: r["name"].lower(), "maps": lambda r: (len(r["maps"]), r["name"].lower()),
                "size": lambda r: r["size"], "date": lambda r: r["mtime"]}[col]
+        # every word of the search is in the addon name or one of its map names
+        words = (self.v_addon_find.get() if getattr(self, "v_addon_find", None) else "").lower().split()
         for r in sorted(self._addon_rows.values(), key=key, reverse=rev):
+            if words:
+                hay = " ".join([r["name"]] + list(r["maps"])).lower()
+                if not all(w in hay for w in words):
+                    continue
             date = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"])) if r["mtime"] else ""
             tree.insert("", "end", iid=r["name"], values=(r["name"], ", ".join(r["maps"]) or "-",
                                                           _human_size(r["size"]), date))

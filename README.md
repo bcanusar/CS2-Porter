@@ -32,7 +32,7 @@ you. CS2 Porter goes further:
 | Sound | Ambient sounds and soundscapes become CS2 sound events with the same range and fade. |
 | Map fixes | Decals are put back onto their surfaces, clip brushes are rebuilt from the `.bsp`, entities CS2 does not have are converted or removed, and unknown keys are cleaned up. Thin boost and gravity triggers are made thick enough to work, spawn points stuck in the floor are lifted, empty brush entities are removed, and entity names like `1.01` keep their exact text. |
 | Missing assets | Lists what a ported map (and the models in its addon) still misses, searches for it in your games and adds it to the addon. A model whose material exists nowhere can get a placeholder material, so it still compiles. |
-| Addons | Lists your CS2 addons with their maps, size and last change; opens or deletes them (to the Recycle Bin). |
+| Addons | Lists your CS2 addons with their maps, size and last change, with a search by addon or map name; opens or deletes them (to the Recycle Bin). |
 | Tools | Converters for single files and folders: materials, models, images, translucency masks, skyboxes (from six faces or one open cube image), and Polyhaven / Megascans models, plants and textures. |
 | Report | Every port writes a full `report.txt`: each step, every file and where it came from, and what could not be found. |
 | Comfort | English, Turkish, Russian and Chinese, dark and light theme, drag and drop and copy / paste everywhere, and updates from inside the program. |
@@ -77,7 +77,7 @@ Other tabs:
   it with the files it needs.
 - **Tools**: converts single files or folders (materials, models, images, skyboxes, Polyhaven and
   Megascans assets).
-- **Addons**: lists your CS2 addons, opens their folders or deletes them.
+- **Addons**: lists your CS2 addons, searches them, opens their folders or deletes them.
 - **Settings**: language, theme, the CS2 folder, extra folders with Source 1 files, and the
   port options.
 

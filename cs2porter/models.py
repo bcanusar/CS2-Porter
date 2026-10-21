@@ -220,6 +220,39 @@ def parse_qc(path):
 # ---------------------------------------------------------------------------
 
 _CHOICE_RE = re.compile(r'\n([ \t]*)_class = "BodyGroupChoice"\n')
+_ANIM_FILE_RE = re.compile(r'_class = "AnimFile"')
+_FIRST_SEQ_RE = re.compile(r'source_filename = "[^"]*_0\.dmx"')
+
+
+_ANIM_NAME_RE = re.compile(r'\bname = "([^"]+)"')
+
+
+def first_anim_name(text):
+    """Name of the first sequence (the animation file ending in _0) of an imported .vmdl, or None."""
+    starts = [m.start() for m in _ANIM_FILE_RE.finditer(text)]
+    for i, s in enumerate(starts):
+        block = text[s:starts[i + 1] if i + 1 < len(starts) else len(text)]
+        if _FIRST_SEQ_RE.search(block):
+            m = _ANIM_NAME_RE.search(block)
+            return m.group(1) if m else None
+    return None
+
+
+def default_idle_anim(text):
+    """A Source 1 prop plays its first sequence when the map gives it no animation, but the
+    importer marks no animation as the default idle one, so CS2 shows the bind pose (a model
+    whose first sequence turns its root bone then stands 90 degrees off). The first sequence
+    (the animation file ending in _0) becomes the default idle animation."""
+    if "is_default_idle_anim = true" in text:
+        return text
+    starts = [m.start() for m in _ANIM_FILE_RE.finditer(text)]
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(text)
+        block = text[s:e]
+        if _FIRST_SEQ_RE.search(block) and "is_default_idle_anim = false" in block:
+            block = block.replace("is_default_idle_anim = false", "is_default_idle_anim = true", 1)
+            return text[:s] + block + text[e:]
+    return text
 
 
 def name_body_group_choices(text):
@@ -678,7 +711,7 @@ class ModelConverter:
         try:
             with open(vmdl_abs, "r", encoding="utf-8") as f:
                 text = f.read()
-            named = name_body_group_choices(text)
+            named = default_idle_anim(name_body_group_choices(text))
             if named != text:
                 with open(vmdl_abs, "w", encoding="utf-8", newline="\n") as f:
                     f.write(named)

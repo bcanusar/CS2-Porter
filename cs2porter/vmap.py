@@ -54,7 +54,8 @@ class Fixes:
                  ropes=None, ambients=None, water=None, commands=False, uv_sizes=None,
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
                  surface_lights=None, underwater=None, sprite_textures=None, decals=None,
-                 skybox_ref=None, sky_map=None, decimals=None, no_shadows=False):
+                 skybox_ref=None, sky_map=None, decimals=None, no_shadows=False,
+                 start_anims=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
         self.occluder_vmat = occluder_vmat  # material for the sky brushes (None: tools/toolsskybox)
@@ -94,6 +95,8 @@ class Fixes:
         # a fully bright map: no mesh casts shadows, so the added sun (vmf.add_fullbright_sun)
         # reaches the light probes everywhere (the light rooms are added later and keep theirs)
         self.no_shadows = no_shadows
+        # {vmdl path lower: first animation} of the animated models (see set_start_anims)
+        self.start_anims = start_anims or {}
         # main map of a 3D skybox: the skybox map its skybox_reference shows ('maps/x.vmap')
         self.skybox_ref = skybox_ref
         # the skybox map itself: {"offset": moves the sky_camera onto the origin, "box": (mins,
@@ -393,6 +396,26 @@ def edit_entities(text, fn):
         return text, 0
     out.append(text[pos:])
     return "".join(out), changed
+
+
+_ANIM_PROPS = ("prop_dynamic", "prop_dynamic_override")
+
+
+def set_start_anims(text, anims):
+    """A Source 1 prop_dynamic the map gives no animation plays its model's first sequence; CS2
+    shows the bind pose instead (a model whose first sequence turns its root bone then stands 90
+    degrees off). Such props get that animation as their Starting Animation. anims: {vmdl path
+    lower: animation name}. Returns (text, props changed)."""
+    def fn(p, _origin):
+        if p.get("classname", "") not in _ANIM_PROPS:
+            return None
+        name = anims.get((p.get("model") or "").replace("\\", "/").lower())
+        if not name or (p.get("startinganim") or "").strip() or (p.get("idleanim") or "").strip():
+            return None
+        # Starting Animation is only used without an animation graph (the model has none)
+        return {"StartingAnim": name, "use_animgraph": "0"}
+
+    return edit_entities(text, fn)
 
 
 def _num(value):
@@ -1221,6 +1244,9 @@ def _edit_text(text, fx, table, stats):
     if fx.sky_vmat and "env_sky" in text:
         text, n = set_env_sky(text, fx.sky_vmat)
         stats["envsky"] += n
+    if fx.start_anims:
+        text, n = set_start_anims(text, fx.start_anims)
+        stats["start_anims"] = stats.get("start_anims", 0) + n
     if "light_" in text:
         text, n, lum, raised = fix_lights(text, table, fx.lumens)
         stats["lights"] += n
@@ -1553,6 +1579,8 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
         log(t("vm_particle_names", n=stats["particle_names"]), "ok")
     if stats.get("no_shadows"):
         log(t("vm_no_shadows", n=stats["no_shadows"]), "ok")
+    if stats.get("start_anims"):
+        log(t("vm_start_anims", n=stats["start_anims"]), "ok")
     if stats["blend_faces"]:
         log(t("vm_blend", n=stats["blend_faces"], m=stats["blend_meshes"]), "ok")
     if stats.get("blend_error"):
