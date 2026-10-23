@@ -512,7 +512,8 @@ def _paint_mesh(mesh, materials, indexes, stats):
             e = edge_next[e]
             if e == e0:
                 break
-        levels_of[f] = max((int(levels[x][0]) for x in loop if x < len(levels)), default=0)
+        # subdivisionLevels follows the face vertex data, not the half-edges
+        levels_of[f] = max((int(levels[edge_fvd[x]][0]) for x in loop if edge_fvd[x] < len(levels)), default=0)
         if levels_of[f] <= 0 or len(loop) != 4:
             continue
         mi = int(mat_idx[face_data[f]][0]) if f < len(face_data) else 0

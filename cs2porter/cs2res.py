@@ -99,6 +99,18 @@ def texture_refs(data):
     return [m.group(1).decode("ascii") for m in _VTEX_RE.finditer(rerl)]
 
 
+_VMAT_RE = re.compile(rb"(?<![!-~])([!-~]+?\.vmat)\x00")
+
+
+def material_refs(data):
+    """Materials ('materials/x.vmat') a compiled model uses, from its external reference list."""
+    try:
+        rerl = blocks(data).get("RERL") or b""
+    except (ValueError, struct.error):
+        return []
+    return [m.group(1).decode("ascii").lower() for m in _VMAT_RE.finditer(rerl)]
+
+
 def material_shader(data):
     """Shader file name ('csgo_complex.vfx') of a compiled material, None when unreadable."""
     try:

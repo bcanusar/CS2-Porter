@@ -55,7 +55,7 @@ class Fixes:
                  effects=None, cable_missing=None, vis_bounds=None, light_rooms=None, particle_names=None,
                  surface_lights=None, underwater=None, sprite_textures=None, decals=None,
                  skybox_ref=None, sky_map=None, decimals=None, no_shadows=False,
-                 start_anims=None):
+                 start_anims=None, sky_clips=None, moondome_vmats=None, momentum_script=None):
         self.sky_alias = sky_alias          # stand-in material used for toolsskybox faces
         self.sky_vmat = sky_vmat            # env_sky material (None: leave env_sky as it is)
         self.occluder_vmat = occluder_vmat  # material for the sky brushes (None: tools/toolsskybox)
@@ -97,6 +97,12 @@ class Fixes:
         self.no_shadows = no_shadows
         # {vmdl path lower: first animation} of the animated models (see set_start_anims)
         self.start_anims = start_anims or {}
+        # sky faces copied as player clip faces: [(normal, polygon)] (vmf.sky_clip_faces)
+        self.sky_clips = sky_clips or []
+        # moondome materials of the addon ('materials/x.vmat'): their meshes cast no shadows
+        self.moondome_vmats = tuple(v.lower() for v in moondome_vmats or ())
+        # script of the Momentum Mod triggers ('scripts/x.vjs', momentum.SCRIPT_REF): a point_script runs it
+        self.momentum_script = momentum_script
         # main map of a 3D skybox: the skybox map its skybox_reference shows ('maps/x.vmap')
         self.skybox_ref = skybox_ref
         # the skybox map itself: {"offset": moves the sky_camera onto the origin, "box": (mins,
@@ -272,6 +278,16 @@ def replace_sky(text, alias, new_vmat):
 def clip_meshes(text, vmat):
     """Sets physicsCollisionProperty to clip on every mesh that uses vmat, and turns its shadows
     off (the sky occluder casts shadows like a wall, the other faces of a sky brush too)."""
+    return _mesh_settings(text, (vmat,), clip=True)
+
+
+def no_shadow_meshes(text, vmats):
+    """Turns the shadows off on every mesh that uses one of vmats (moondome materials cast
+    shadows like a wall, as the sky occluder does). Returns (text, meshes changed)."""
+    return _mesh_settings(text, vmats, clip=False)
+
+
+def _mesh_settings(text, vmats, clip):
     lines = text.split("\n")
     in_mats = flagged = False
     count = 0
@@ -283,12 +299,15 @@ def clip_meshes(text, vmat):
         if in_mats:
             if s.startswith("]"):
                 in_mats = False
-            elif vmat in s:
+            elif any(vmat in s.lower() for vmat in vmats):
                 flagged = True
             continue
         if flagged and s.startswith('"disableShadows" "int"'):
             indent = line[:len(line) - len(line.lstrip())]
             lines[i] = f'{indent}"disableShadows" "int" "1"'
+            if not clip:
+                flagged = False
+                count += 1
         elif flagged and s.startswith('"physicsCollisionProperty" "string"'):
             indent = line[:len(line) - len(line.lstrip())]
             lines[i] = f'{indent}"physicsCollisionProperty" "string" "clip"'
@@ -840,6 +859,116 @@ def _room_mesh(ind, origin):
     return "\n".join(ind + line if line else line for line in text.split("\n"))
 
 
+SKY_CLIP_VMAT = "materials/tools/toolsplayerclip.vmat"
+# texture axes of a face by its main normal axis (as the importer writes brush faces)
+_SKY_CLIP_AXES = {0: ((0, 1, 0), (0, 0, -1)), 1: ((1, 0, 0), (0, 0, -1)), 2: ((1, 0, 0), (0, -1, 0))}
+
+
+def sky_clip_mesh(ind, faces):
+    """One open mesh with a player clip face on every sky face (vmf.sky_clip_faces: [(normal,
+    polygon)]), like sky faces pasted in Hammer with a clip material: every face has its own
+    vertices, its edges are open (the outer half edges have no face)."""
+    def eid():
+        return str(uuid.uuid4())
+
+    def vec(v):
+        return " ".join(_num(c) for c in v)
+
+    pos, ev, eo, en, ef, ed, evd, ve, fe = [], [], [], [], [], [], [], [], []
+    uv, nrm, tan, scales, axu, axv = [], [], [], [], [], []
+    for f, (n, poly) in enumerate(faces):
+        cnt, vb, hb = len(poly), len(pos), len(ev)
+        u, v = _SKY_CLIP_AXES[max(range(3), key=lambda k: abs(n[k]))]
+        for i in range(cnt):
+            inner, outer = hb + 2 * i, hb + 2 * i + 1
+            # half edges point to their vertex: the inner one goes around the face from vertex i
+            # to i + 1, the outer one back along the open edge
+            ev += [vb + (i + 1) % cnt, vb + i]
+            eo += [outer, inner]
+            en += [hb + 2 * ((i + 1) % cnt), hb + 2 * ((i - 1) % cnt) + 1]
+            ef += [f, -1]
+            ed += [hb // 2 + i] * 2
+            evd += [inner, outer]
+            ve.append(inner)
+            p = poly[(i + 1) % cnt]
+            uv += [f"{_num(sum(a * b for a, b in zip(p, u)) / 32.0)} {_num(sum(a * b for a, b in zip(p, v)) / 32.0)}",
+                   "0 0"]
+            nrm += [vec(n), "0 0 0"]
+            tan += [vec(u) + " 1", "0 0 0 0"]
+        pos += [vec(p) for p in poly]
+        fe.append(hb)
+        scales.append("0.25 0.25")
+        axu.append(vec(u) + " 0")
+        axv.append(vec(v) + " 0")
+    i1, i2, i3, i4, i5 = (ind + "\t" * k for k in range(1, 6))
+
+    def arr(pad, name, typ, values):
+        return [f'{pad}"{name}" "{typ}" ', f"{pad}["] + [f'{pad}\t"{x}",' for x in values[:-1]] + \
+            ([f'{pad}\t"{values[-1]}"'] if values else []) + [f"{pad}]"]
+
+    def stream(name, flags, typ, values):
+        attr = name.split(":")[0]
+        return [f'{i4}"CDmePolygonMeshDataStream"', f"{i4}{{", f'{i5}"id" "elementid" "{eid()}"',
+                f'{i5}"name" "string" "{name}"', f'{i5}"standardAttributeName" "string" "{attr}"',
+                f'{i5}"semanticName" "string" "{attr}"', f'{i5}"semanticIndex" "int" "0"',
+                f'{i5}"vertexBufferLocation" "int" "0"', f'{i5}"dataStateFlags" "int" "{flags}"',
+                f'{i5}"subdivisionBinding" "element" ""'] + arr(i5, "data", typ, values) + [f"{i4}}}"]
+
+    def data_array(name, size, streams):
+        body = []
+        for k, s in enumerate(streams):
+            body += s
+            if k < len(streams) - 1:
+                body[-1] += ","
+        return [f'{i2}"{name}" "CDmePolygonMeshDataArray"', f"{i2}{{", f'{i3}"id" "elementid" "{eid()}"',
+                f'{i3}"size" "int" "{size}"', f'{i3}"streams" "element_array" ', f"{i3}["] + body + \
+            [f"{i3}]", f"{i2}}}", ""]
+
+    nf, nh = len(faces), len(ev)
+    lines = [f'{ind}"CMapMesh"', f"{ind}{{", f'{i1}"id" "elementid" "{eid()}"', f'{i1}"nodeID" "int" "0"',
+             f'{i1}"referenceID" "uint64" "0x{random.getrandbits(64):016x}"',
+             f'{i1}"children" "element_array" ', f"{i1}[", f"{i1}]",
+             f'{i1}"variableTargetKeys" "string_array" ', f"{i1}[", f"{i1}]",
+             f'{i1}"variableNames" "string_array" ', f"{i1}[", f"{i1}]",
+             f'{i1}"meshData" "CDmePolygonMesh"', f"{i1}{{", f'{i2}"id" "elementid" "{eid()}"',
+             f'{i2}"name" "string" "meshData"']
+    lines += arr(i2, "vertexEdgeIndices", "int_array", ve)
+    lines += arr(i2, "vertexDataIndices", "int_array", list(range(len(pos))))
+    lines += arr(i2, "edgeVertexIndices", "int_array", ev)
+    lines += arr(i2, "edgeOppositeIndices", "int_array", eo)
+    lines += arr(i2, "edgeNextIndices", "int_array", en)
+    lines += arr(i2, "edgeFaceIndices", "int_array", ef)
+    lines += arr(i2, "edgeDataIndices", "int_array", ed)
+    lines += arr(i2, "edgeVertexDataIndices", "int_array", evd)
+    lines += arr(i2, "faceEdgeIndices", "int_array", fe)
+    lines += arr(i2, "faceDataIndices", "int_array", list(range(nf)))
+    lines += arr(i2, "materials", "string_array", [SKY_CLIP_VMAT])
+    lines += data_array("vertexData", len(pos), [stream("position:0", 3, "vector3_array", pos)])
+    lines += data_array("faceVertexData", nh, [stream("texcoord:0", 1, "vector2_array", uv),
+                                                stream("normal:0", 1, "vector3_array", nrm),
+                                                stream("tangent:0", 1, "vector4_array", tan)])
+    lines += data_array("edgeData", nh // 2, [stream("flags:0", 3, "int_array", [0] * (nh // 2))])
+    lines += data_array("faceData", nf, [stream("textureScale:0", 0, "vector2_array", scales),
+                                         stream("textureAxisU:0", 0, "vector4_array", axu),
+                                         stream("textureAxisV:0", 0, "vector4_array", axv),
+                                         stream("materialindex:0", 8, "int_array", [0] * nf),
+                                         stream("flags:0", 3, "int_array", [0] * nf),
+                                         stream("lightmapScaleBias:0", 1, "int_array", [0] * nf)])
+    lines += [f'{i2}"subdivisionData" "CDmePolygonMeshSubdivisionData"', f"{i2}{{", f'{i3}"id" "elementid" "{eid()}"']
+    lines += arr(i3, "subdivisionLevels", "int_array", [0] * nh)
+    lines += [f'{i3}"streams" "element_array" ', f"{i3}[", f"{i3}]", f"{i2}}}", "", f"{i1}}}", ""]
+    with open(ROOM_MESH_FILE, "r", encoding="utf-8") as f:
+        tail = f.read().rstrip("\n").split("\n")
+    # the rest (transform, render and physics settings) as in the room mesh, without shadows
+    start = next(k for k, line in enumerate(tail) if line.startswith('\t"origin" "vector3"'))
+    for line in tail[start:]:
+        line = line.replace("$ORIGIN", "0 0 0").replace("$SEED", str(random.randint(1, 2 ** 31 - 1)))
+        line = re.sub(r"\$ID", lambda _m: eid(), line)
+        line = line.replace('"disableShadows" "int" "0"', '"disableShadows" "int" "1"')
+        lines.append(ind + line if line else line)
+    return "\n".join(lines)
+
+
 def light_room_blocks(ind, rooms):
     """Elements of the light probe volumes (probes.plan()): every volume bakes its cubemap in its
     own white room (a mesh with a light); a volume without a room bakes it in its middle. The
@@ -1237,6 +1366,9 @@ def _edit_text(text, fx, table, stats):
     if fx.occluder_vmat and fx.occluder_vmat in text:
         text, n = clip_meshes(text, fx.occluder_vmat)
         stats["clip"] += n
+    if fx.moondome_vmats:
+        text, n = no_shadow_meshes(text, fx.moondome_vmats)
+        stats["moondome"] = stats.get("moondome", 0) + n
     if fx.no_shadows:
         n = len(_SHADOWS_ON_RE.findall(text))
         text = _SHADOWS_ON_RE.sub(r'\g<1>1"', text)
@@ -1444,6 +1576,16 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
                 res.bhop_entities = sum(1 for c in added if c in ("point_script", "logic_case"))
         except ValueError as e:
             log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
+    if fx.momentum_script and not any(f'"cs_script" "string" "{fx.momentum_script}"' in tx for tx in texts.values()):
+        try:
+            start, _end = _world_children(texts[main])
+            ind = re.match(r"[ \t]*", texts[main][texts[main].rfind("\n", 0, start) + 1:]).group(0) + "\t"
+            block = _entity_block(ind, [("classname", "point_script"), ("targetname", ""),
+                                        ("cs_script", fx.momentum_script)], origin=f"0 {-ENTITY_SPACING} 0")
+            texts[main] = renumber_nodes(add_to_world(texts[main], [block]))
+            stats["momentum_script"] = 1
+        except ValueError as e:
+            log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
     if fx.vis_bounds:
         try:
             start, _end = _world_children(texts[main])
@@ -1474,6 +1616,13 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
             stats["light_volumes"] = len(fx.light_rooms)
             stats["light_rooms"] = sum(1 for r in fx.light_rooms if r[2])
         except (ValueError, OSError) as e:
+            log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
+    if fx.sky_clips:
+        try:
+            start, _end = _world_children(texts[main])
+            ind = re.match(r"[ \t]*", texts[main][texts[main].rfind("\n", 0, start) + 1:]).group(0) + "\t"
+            texts[main] = renumber_nodes(add_to_world(texts[main], [sky_clip_mesh(ind, fx.sky_clips)]))
+        except (ValueError, OSError, StopIteration) as e:
             log(t("vm_fail", file=os.path.basename(main), e=e), "warn")
     if fx.skybox_ref or fx.sky_map:
         try:
@@ -1550,6 +1699,10 @@ def post_process(valve, work_dir, maps_dir, map_name, fx, log=None):
     # --- log --------------------------------------------------------------------------
     if stats["sky"]:
         log(t("vm_occluder", n=stats["clip"]) if fx.occluder_vmat else t("vm_sky", n=stats["sky"]), "ok")
+    if stats.get("moondome"):
+        log(t("vm_moondome", n=stats["moondome"]), "ok")
+    if stats.get("momentum_script"):
+        log(t("vm_momentum", f=fx.momentum_script), "ok")
     if stats["envsky"]:
         log(t("vm_envsky", vmat=fx.sky_vmat), "ok")
     if stats["lights"]:

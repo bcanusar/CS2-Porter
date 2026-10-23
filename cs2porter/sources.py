@@ -460,29 +460,41 @@ class CS2Index:
     BROKEN_SHADERS = ("error.vfx", "csgo_decalmodulate.vfx")
 
     def broken_in_cs2(self, rel_c):
-        """Is CS2's own compiled material rel_c ('materials/x.vmat_c') one that draws wrong?"""
+        """Is CS2's own compiled material rel_c ('materials/x.vmat_c') one that draws wrong? A
+        compiled model ('models/x.vmdl_c') is broken when a material it uses is missing from
+        CS2 or draws wrong (models/props_vehicles/van001a names van001a_01, which CS2 lacks)."""
         rel_c = _norm(rel_c)
         if rel_c in self._broken:
             return self._broken[rel_c]
         bad = False
-        if rel_c.endswith(".vmat_c") and rel_c in self.paths:
+        if rel_c.endswith(".vmdl_c") and rel_c in self.paths:
+            from .cs2res import material_refs
+            data = self._read_cs2(rel_c)
+            if data is not None:
+                bad = any(not self.in_cs2(m + "_c") or self.broken_in_cs2(m + "_c") for m in material_refs(data))
+        elif rel_c.endswith(".vmat_c") and rel_c in self.paths:
             from .cs2res import material_shader, texture_refs
-            for p in self._vpks:
-                try:
-                    arc = self._arcs.get(p)
-                    if arc is None:
-                        arc = self._arcs[p] = VPKArchive(p)
-                    if rel_c in arc.entries:
-                        data = arc.read(rel_c)
-                        # a texture CS2 does not have draws as the missing texture checkers
-                        # (effects/offgaragedr names metal/offgaragedr_color)
-                        bad = (material_shader(data) in self.BROKEN_SHADERS
-                               or any(_norm(t + "_c") not in self.paths for t in texture_refs(data)))
-                        break
-                except (OSError, VPKError):
-                    continue
+            data = self._read_cs2(rel_c)
+            if data is not None:
+                # a texture CS2 does not have draws as the missing texture checkers
+                # (effects/offgaragedr names metal/offgaragedr_color)
+                bad = (material_shader(data) in self.BROKEN_SHADERS
+                       or any(_norm(t + "_c") not in self.paths for t in texture_refs(data)))
         self._broken[rel_c] = bad
         return bad
+
+    def _read_cs2(self, rel_c):
+        """Bytes of a file of CS2's VPKs, None when it can not be read."""
+        for p in self._vpks:
+            try:
+                arc = self._arcs.get(p)
+                if arc is None:
+                    arc = self._arcs[p] = VPKArchive(p)
+                if rel_c in arc.entries:
+                    return arc.read(rel_c)
+            except (OSError, VPKError):
+                continue
+        return None
 
     def in_cs2_working(self, rel_c):
         """In CS2 and not one of its materials that draw wrong."""

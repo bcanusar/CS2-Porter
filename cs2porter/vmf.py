@@ -869,32 +869,40 @@ def _swap_sky_material(root, alias, mats=SKYBOX_MATS):
     return count
 
 
-def add_sky_clips(root):
-    """The sky occluder has no collision in CS2: every world / func_detail brush with a sky face
-    gets a player clip copy in the same place. Returns the number of copies."""
-    max_id = _max_solid_id(root)
-    count = 0
+def sky_clip_faces(root):
+    """The sky occluder has no collision in CS2: the sky faces of the world / func_detail brushes
+    are copied as player clip faces (vmap.sky_clip_mesh), like pasting the faces in Hammer and
+    giving them a clip material, so only the sky faces block. Returns [(normal, polygon)]: the
+    polygon wound counter clockwise seen from the side the face looks at."""
+    from .blend import _cross, _dot, _norm, _plane_points, _sub
+    faces = []
     owners = [root.child("world")] + [e for e in root.children("entity") if e.classname == "func_detail"]
     for owner in owners:
         if owner is None:
             continue
-        copies = []
         for solid in owner.children("solid"):
-            if not any(normalize_material(s.get("material", "")) in SKYBOX_MATS for s in solid.children("side")):
+            sides = solid.children("side")
+            if not any(normalize_material(s.get("material", "")) in SKYBOX_MATS for s in sides):
                 continue
-            clip = _copy_node(solid)
-            clip.items = [i for i in clip.items if not (isinstance(i, VNode) and i.name.lower() == "editor")]
-            max_id += 1
-            clip.set("id", str(max_id))
-            for side in clip.children("side"):
-                side.items = [i for i in side.items if not (isinstance(i, VNode) and i.name.lower() in ("vertices_plus", "dispinfo"))]
-                max_id += 1
-                side.set("id", str(max_id))
-                side.set("material", PLAYERCLIP_MAT)
-            copies.append(clip)
-        owner.items += copies
-        count += len(copies)
-    return count
+            planes = []
+            for side in sides:
+                pts = _plane_points(side.get("plane"))
+                if pts is None:
+                    break
+                n = _norm(_cross(_sub(pts[2], pts[0]), _sub(pts[1], pts[0])))
+                planes.append((n, _dot(n, pts[0])))
+            else:
+                for (n, _d), src, poly in zip(*_brush_faces(planes, sides)):
+                    if normalize_material(src.get("material", "")) not in SKYBOX_MATS:
+                        continue
+                    turn = [0.0, 0.0, 0.0]
+                    for i in range(1, len(poly) - 1):
+                        c = _cross(_sub(poly[i], poly[0]), _sub(poly[i + 1], poly[0]))
+                        turn = [turn[k] + c[k] for k in range(3)]
+                    if _dot(turn, n) < 0:
+                        poly = poly[::-1]
+                    faces.append((tuple(n), [tuple(p) for p in poly]))
+    return faces
 
 
 LADDER_MATS =("tools/toolsinvisibleladder", "tools/toolsinvisibleladder_wood")
@@ -1524,13 +1532,23 @@ def _raise_boost_triggers(root):
     return count
 
 
+def _invisible_physbox(ent):
+    """A func_physbox made only of toolsinvisible faces (used like a trigger): CS2 misses very
+    wide and thin ones the same way, so they are split like the triggers."""
+    if ent.classname not in ("func_physbox", "func_physbox_multiplayer"):
+        return False
+    sides = [s for solid in ent.children("solid") for s in solid.children("side")]
+    return bool(sides) and all(normalize_material(s.get("material", "")) == "tools/toolsinvisible" for s in sides)
+
+
 def _split_triggers(root):
-    """Trigger boxes that are very wide for their height are not detected by CS2. They are split
-    into pieces (see split_piece_size) inside the same entity, so the outputs stay the same."""
+    """Trigger boxes (and invisible physboxes, see _invisible_physbox) that are very wide for
+    their height are not detected by CS2. They are split into pieces (see split_piece_size)
+    inside the same entity, so the outputs stay the same."""
     max_id = _max_solid_id(root)
     count = 0
     for ent in root.children("entity"):
-        if not ent.classname.startswith("trigger_"):
+        if not (ent.classname.startswith("trigger_") or _invisible_physbox(ent)):
             continue
         new_items = []
         for item in ent.items:
@@ -3149,11 +3167,15 @@ def decimal_values(roots):
 LIGHTGLOW_RADIUS = 48.0
 
 
-def _sprite_alpha(ent):
+def _sprite_alpha(ent, sprite=True):
     """Sprites without renderamt are fully visible in Source 1; the importer would make their
-    glow alpha 0."""
+    glow alpha 0. The glow particle of a sprite starts the way the sprite did: a named sprite
+    without 'Start on' is off until ShowSprite (CSprite::Spawn), an unnamed one is always on."""
     if ent.get("renderamt") is None:
         ent.set("renderamt", "255")
+    if sprite and ent.get("start_active") is None:
+        on = bool(_spawnflags(ent) & 1) or not (ent.get("targetname") or "").strip()
+        ent.set("start_active", "1" if on else "0")
 
 
 _AXIS_SCALE_RE = re.compile(r"^(.*\]\s*)(-?\d+\.\d{4})\s*$")
@@ -3194,7 +3216,8 @@ def _snap_texture_scales(root):
 
 
 def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key=None,
-                split_triggers=False, effects=None, log=None, bhop_blocks=False, world=None, strip_key=None):
+                split_triggers=False, effects=None, log=None, bhop_blocks=False, world=None, strip_key=None,
+                momentum=None):
     """Applies the VMF fixes made before the import. Returns a summary of the changes.
     attributes: dict that receives the attribute names of the converted name / class filters.
     meshes: dict that receives the func_brush entities to turn into meshes (see vmap).
@@ -3204,7 +3227,9 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     effects: dict that receives the particle entities made from env_steam etc.
     bhop_blocks: Source 1 bhop blocks become bhop script blocks (needs teleport_key).
     world: the compiled map (lighting.BspTracer), for the thin triggers that grow down towards
-    the floor."""
+    the floor.
+    momentum: dict that receives the settings of the Momentum Mod triggers for their script
+    (momentum.convert)."""
     stats = {"base": 0, "targetnames": 0, "lights": 0, "brushes": 0, "render": 0,
              "dynprops": 0, "modelscale": 0, "skins": 0, "perfmode": 0, "particles": 0, "physbox": 0,
              "skiphint_removed": 0, "skiphint_replaced": 0, "skybox": 0, "ladders": 0,
@@ -3217,6 +3242,9 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["cubemaps"] = _remove_classes(root, CUBEMAP_CLASSES)
     stats["empty"] = _remove_empty_brush_entities(root)
     stats["zones"] = _zones_to_triggers(root)
+    from . import momentum as momentummod
+    stats["mom_teleports"], stats["mom_speed"], stats["mom_slide"] = \
+        momentummod.convert(root, momentum if momentum is not None else {})
     stats["lifted"] = _lift_spawns(root)
     stats["spawns"] = _fill_spawns(root)
     stats["nonsolid"] = _nonsolid_disps(root)
@@ -3284,7 +3312,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
         cls = ent.classname
         if cls == "env_lightglow":
             ent.items[ent.index_of_key("classname")] = ["classname", "env_sprite"]
-            _sprite_alpha(ent)
+            _sprite_alpha(ent, sprite=False)
             # its glow is HorizontalGlowSize / VerticalGlowSize units out from the middle; the
             # glow particle is LIGHTGLOW_RADIUS at scale 1 (it was drawn 3 times too big)
             size = max(_float(ent.get("HorizontalGlowSize"), 30.0), _float(ent.get("VerticalGlowSize"), 30.0))
@@ -3294,6 +3322,13 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
             idx = ent.index_of_key("classname")
             ent.items[idx] = ["classname", "env_sprite"]
             ent.items.insert(idx + 1, ["clientSideEntity", "1"])
+            _sprite_alpha(ent)
+            stats["particles"] += 1
+        elif cls == "env_sprite_oriented":
+            # CS2 has no oriented sprite (the import keeps the class and its sprite does not
+            # draw); as an env_sprite it becomes a glow particle with the sprite's texture that
+            # ShowSprite / HideSprite start and remove (it faces the camera)
+            ent.items[ent.index_of_key("classname")] = ["classname", "env_sprite"]
             _sprite_alpha(ent)
             stats["particles"] += 1
         elif cls == "env_sprite":
@@ -3319,7 +3354,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
                   "landmarks", "weaponstrip", "beam_sparks", "int_keys", "empty", "lifted", "push_pads",
-                  "anim_inputs", "material_controls", "overlays"):
+                  "anim_inputs", "material_controls", "overlays", "mom_teleports", "mom_speed", "mom_slide"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

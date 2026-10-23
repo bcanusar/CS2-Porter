@@ -15,6 +15,7 @@ from . import config
 from . import deps as depsmod
 from . import fgd as fgdmod
 from . import lighting as lightingmod
+from . import momentum as momentummod
 from . import particles as particlesmod
 from . import postfx as postfxmod
 from . import probes as probesmod
@@ -1398,6 +1399,26 @@ def _start_anims(content_dir, models):
     return out
 
 
+def _moondome_vmats(content_dir):
+    """'materials/x.vmat' of the addon's moondome materials (WindowImposter surfaces, the sky
+    brushes of older versions): their meshes cast no shadows (vmap.no_shadow_meshes)."""
+    out = []
+    root = os.path.join(content_dir, "materials")
+    for folder, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.lower().endswith(".vmat"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    if "csgo_moondome.vfx" not in f.read():
+                        continue
+            except OSError:
+                continue
+            out.append("materials/" + os.path.relpath(path, root).replace("\\", "/").lower())
+    return out
+
+
 def _tracer(info, root):
     """Line traces against the compiled map (None for a .vmf input or a broken .bsp)."""
     if info is None:
@@ -1686,12 +1707,13 @@ def port_map(cfg, ctx, input_path, addon_name):
     lights, vis_bounds, light_rooms = _light_setup(ctx, opts, root, None if is_vmf else info, tracer)
     if sky3d:
         sky3d.lights = _lights_of(ctx, opts, sky3d.root, info, tracer)
+    sky_clips = []
     if sky_alias and opts.get("sky_occluder", True):
-        # the sky occluder has no collision: player clip copies of the sky brushes (before the
-        # white rooms get theirs, those stay without)
-        clips = vmfmod.add_sky_clips(root)
-        if clips:
-            ctx.detail(t("d_sky_clips", n=clips))
+        # the sky occluder has no collision: player clip copies of the sky faces, added to the
+        # .vmap (before the white rooms get their sky brushes, those stay without)
+        sky_clips = vmfmod.sky_clip_faces(root)
+        if sky_clips:
+            ctx.detail(t("d_sky_clips", n=len(sky_clips)))
     if light_rooms and sky_alias:
         # the white rooms are wrapped in sky brushes (occluder) so they look like the sky
         shells = vmfmod.add_room_shells(root, light_rooms, probesmod.ROOM_HALF, vmfmod.SKYBOX_MAT)
@@ -1715,12 +1737,14 @@ def port_map(cfg, ctx, input_path, addon_name):
         for r in roots:
             r.items = [i for i in r.items if not (isinstance(i, vmfmod.VNode) and i.name.lower() == "entity"
                                                   and i.classname == "env_sun")]
+    momentum = {}
     for r in roots:
         vmfmod.fix_for_cs2(r, sky_alias=sky_alias, attributes=attributes, meshes=meshes,
                            teleport_key=vmapmod.TELEPORT_KEY if bhop_on else None,
                            split_triggers=bool(opts.get("split_triggers", True)), effects=effects,
                            log=ctx.log if r is root else None, bhop_blocks=blocks, world=tracer,
-                           strip_key=vmapmod.STRIP_KEY if bhop_on else None)
+                           strip_key=vmapmod.STRIP_KEY if bhop_on else None,
+                           momentum=momentum if r is root else None)
     del tracer
     decimals = vmfmod.decimal_values(roots)
     vmfmod.write_vmf(root, vmf_path)
@@ -1848,6 +1872,8 @@ def port_map(cfg, ctx, input_path, addon_name):
                                light_rooms=light_rooms, particle_names=particle_names,
                                sprite_textures=report.sprite_textures, decals=decals, decimals=decimals,
                                no_shadows=fullbright, start_anims=_start_anims(content_dir, models),
+                               sky_clips=sky_clips, moondome_vmats=_moondome_vmats(content_dir),
+                               momentum_script=momentummod.SCRIPT_REF if momentummod.needs_script(momentum) else None,
                                skybox_ref=f"maps/{sky3d.name}.vmap" if sky3d and sky3d.imported else None)
             res = vmapmod.post_process(valve, work, maps_dir, map_name, fx, ctx.log)
             if sky3d and sky3d.imported:
@@ -1863,6 +1889,14 @@ def port_map(cfg, ctx, input_path, addon_name):
             # the bhop script is only needed when the map has basevelocity / gravity / teleport outputs
             if bhop_on and res.bhop_outputs and game_dir:
                 bhop.install(game_dir, ctx.log, bhop_data, bhop_err)
+            if res.stats.get("momentum_script"):
+                try:
+                    path, compiled = momentummod.install(content_dir, game_dir, valve if cs2_ok else None, momentum,
+                                                         os.path.join(work, "momentum_list.txt"))
+                    ctx.log(t("p_momentum_script", path=path) if compiled
+                            else t("p_momentum_source", path=path), "ok" if compiled else "warn")
+                except (OSError, ToolError) as e:
+                    ctx.log(t("snd_fail", f=momentummod.SCRIPT_FILE, e=e), "err")
             kinds = {k for k in ("glows", "beams") if res.stats.get(k)}
             if res.stats.get("effects"):
                 kinds |= set(effects.get("kinds") or {})

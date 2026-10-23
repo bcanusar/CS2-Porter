@@ -327,7 +327,8 @@ def build_vmdl(model_dir, render_smds, physics_smd, remaps, skin_groups, scale=1
 
     physics = ""
     if physics_smd:
-        stem = os.path.splitext(physics_smd)[0]
+        # the node name may not have '-' ("tree_deciduous_01a-lod_physics": resolve failure)
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", os.path.splitext(physics_smd)[0])
         physics = (
             f'{T*3}{{\n'
             f'{T*4}_class = "PhysicsShapeList"\n'
@@ -502,7 +503,10 @@ class ModelConverter:
         if not self.overwrite and self.index.in_addon(vmdl_rel):
             return ModelResult(mdl, "exists", t("m_exists"))
         if not self.convert_cs2_existing and self.index.in_cs2(vmdl_rel + "_c"):
-            return ModelResult(mdl, "cs2", t("m_cs2"))
+            if not self.index.broken_in_cs2(vmdl_rel + "_c"):
+                return ModelResult(mdl, "cs2", t("m_cs2"))
+            # CS2's own copy draws with missing materials: the map's model is converted
+            self.log(t("m_cs2_model_broken", mdl=vmdl_rel), "info")
 
         compiled = [s for s in self.sources.compiled_sources() if s.has(mdl)]
         last = None

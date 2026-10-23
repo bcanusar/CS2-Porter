@@ -172,7 +172,7 @@ def build_vmdl_with_physics(model_path, render_smd, physics_smd, materials, vmat
         f'{T*4}[\n'
         f'{T*5}{{\n'
         f'{T*6}_class = "PhysicsMeshFile"\n'
-        f'{T*6}name = "{physics_stem}"\n'
+        f'{T*6}name = "{re.sub(r"[^A-Za-z0-9_]", "_", physics_stem)}"\n'
         f'{T*6}parent_bone = ""\n'
         f'{T*6}surface_prop = "default"\n'
         f'{T*6}collision_prop = "default"\n'
