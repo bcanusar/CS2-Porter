@@ -1221,7 +1221,12 @@ def unwrap_entities(text, meshes, stats):
         if cls == "info_target" and name.lower() in HELPER_NAMES:
             stats["helpers"] += 1
             return []
-        opts = meshes.get(name) if cls == "func_brush" else None
+        opts = None
+        if cls == "func_brush":
+            # entities of an instance (the displacement holder of the BSP pass) get "<id>_" in front
+            opts = meshes.get(name)
+            if opts is None:
+                opts = meshes.get(re.sub(r"^\d+_", "", name))
         if opts is None:
             return None
         span = _children_span(e)

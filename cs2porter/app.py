@@ -478,6 +478,7 @@ class ScrollFrame(ttk.Frame):
         self.inner = ttk.Frame(self.canvas, style=style)
         self._win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
         self._bar_shown = False
+        self.bar_gap = 0
         self.inner.bind("<Configure>", lambda _e: self._update())
         self.canvas.bind("<Configure>", lambda _e: self._update())
 
@@ -524,7 +525,7 @@ class ScrollFrame(ttk.Frame):
         if show != self._bar_shown:
             self._bar_shown = show
             if show:
-                self.bar.pack(side="right", fill="y", before=self.canvas)
+                self.bar.pack(side="right", fill="y", before=self.canvas, padx=(self.bar_gap, 0))
             else:
                 self.bar.pack_forget()
                 self.canvas.yview_moveto(0)
@@ -2073,7 +2074,8 @@ class App:
                   upperbordercolor=[("selected", ACCENT_DARK)], lowerbordercolor=[("selected", ACCENT_DARK)],
                   foreground=[("disabled", DISABLED)])
         # the boxes laid over the switch cells of the tool lists (bigger, no text)
-        for name, bg in (("Cell.TCheckbutton", FIELD), ("CellSel.TCheckbutton", ROW_SEL)):
+        for name, bg in (("Cell.TCheckbutton", FIELD), ("CellSel.TCheckbutton", ROW_SEL),
+                         ("CellHead.TCheckbutton", CARD)):
             s.configure(name, background=bg, indicatorbackground=FIELD, indicatorforeground=ON_ACCENT,
                         indicatormargin=(0, 0, 0, 0), indicatorsize=15, padding=(4, 2),
                         upperbordercolor=BORDER, lowerbordercolor=BORDER)
@@ -2333,7 +2335,9 @@ class App:
         # files dropped on a tab (not on one of its parts) go here
         self.tab_port.drop_paths = self._drop_maps
         self.tab_tools.drop_paths = lambda paths: self.file_list.add_paths(paths) if self.file_list else (
-            self.cube_editor.drop_paths(paths) if getattr(self, "cube_editor", None) is not None else None)
+            self.cube_editor.drop_paths(paths) if getattr(self, "cube_editor", None) is not None else (
+                getattr(self, "addon_panel", None) and getattr(self.addon_panel, "drop_paths", None)
+                and self.addon_panel.drop_paths(paths)))
         self.tab_settings.drop_paths = self._res_add_dirs
 
         bottom = ttk.Frame(paned)
@@ -2894,7 +2898,8 @@ class App:
         nav = ttk.Frame(wrap, style="Card.TFrame", width=230)
         nav.pack(side="left", fill="y")
         self.v_tool = tk.StringVar(value=tools.tool_by_id(self.cfg.get("last_tool") or "")["id"])
-        for group, key in (("port", "tools_group_port"), ("assets", "tools_group_assets")):
+        for group, key in (("port", "tools_group_port"), ("addon", "tools_group_addon"),
+                           ("assets", "tools_group_assets")):
             ttk.Label(nav, text=t(key), style="NavHead.TLabel").pack(anchor="w", padx=6, pady=(8 if group == "port" else 16, 4))
             for td in tools.TOOLS:
                 if td["group"] != group:
@@ -2919,6 +2924,18 @@ class App:
         cube = td["id"] == "skybox" and self.cfg.get("sky_mode") == "cube"
         ttk.Label(p, text=t("sb_cube_desc" if cube else td["desc"]), style="Inner.TLabel", wraplength=860,
                   justify="left").pack(anchor="w", padx=16, pady=(0, 10))
+        self.addon_panel = None
+        if td.get("panel"):
+            from . import addon_panels
+            self.file_list = None
+            self.cube_editor = None
+            self.btn_tool_stop = None
+            cls = addon_panels.ShaderPanel if td["panel"] == "shader" else addon_panels.SoundPanel
+            self.addon_panel = cls(p, self)
+            self.addon_panel.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+            if td["panel"] == "shader":
+                self.btn_tool = self.addon_panel.btn
+            return
         if td["id"] == "skybox":
             # two ways to make a sky: from Source 1 faces, or from the user's own images
             mrow = ttk.Frame(p, style="Inner.TFrame")
@@ -3173,7 +3190,8 @@ class App:
         self.opt_vars = {}
         tips = {"light_probes": "opt_light_probes_tip", "post_processing": "opt_post_processing_tip",
                 "bhop_blocks": "opt_bhop_blocks_tip", "sky_occluder": "opt_sky_occluder_tip", "sun_in_sky": "opt_sun_in_sky_tip", "sky3d": "opt_sky3d_tip",
-                "model_placeholder": "opt_model_placeholder_tip", "mip_fade": "opt_mip_fade_tip"}
+                "model_placeholder": "opt_model_placeholder_tip", "mip_fade": "opt_mip_fade_tip",
+                "merge_edges": "opt_merge_edges_tip"}
 
         def add_opt(parent, key, label, pad=0):
             v = tk.BooleanVar(value=bool(self.cfg["opts"].get(key, config.DEFAULTS["opts"].get(key, False))))
@@ -3202,6 +3220,21 @@ class App:
             ttk.Label(row, text=t("opt_bhop_post"), style="Card.TLabel").pack(side="left")
         cb = add_opt(left, "bhop_download", "opt_bhop_download", pad=24)
         ToolTip(cb, t("opt_bhop_download_tip"))
+        # shader of the plain ported materials
+        row = ttk.Frame(left, style="Card.TFrame")
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Label(row, text=t("opt_default_shader"), style="Card.TLabel").pack(side="left", padx=(0, 8))
+        choices = config.SHADER_CHOICES
+        cur = self.cfg["opts"].get("default_shader", choices[0])
+        cb = ttk.Combobox(row, values=[t("shader_" + c) for c in choices], state="readonly", width=30)
+        cb.current(choices.index(cur) if cur in choices else 0)
+        cb.pack(side="left")
+
+        def shader_set(_e=None, cb=cb):
+            self.cfg["opts"]["default_shader"] = choices[max(cb.current(), 0)]
+            self._save_later()
+        cb.bind("<<ComboboxSelected>>", shader_set)
+        ToolTip(cb, t("opt_default_shader_tip"))
 
         ttk.Label(right, text=t("set_opts_look"), style="CardMuted.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
@@ -3214,7 +3247,8 @@ class App:
                                      ("post_processing", "opt_post_processing"),
                                      ("model_placeholder", "opt_model_placeholder"))),
                           (cols[1], (("sky_occluder", "opt_sky_occluder"), ("sun_in_sky", "opt_sun_in_sky"),
-                                     ("sky3d", "opt_sky3d"), ("mip_fade", "opt_mip_fade")))):
+                                     ("sky3d", "opt_sky3d"), ("mip_fade", "opt_mip_fade"),
+                                     ("merge_edges", "opt_merge_edges")))):
             for key, label in opts:
                 add_opt(col, key, label)
 

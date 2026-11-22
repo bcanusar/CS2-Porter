@@ -101,8 +101,15 @@ DEFAULTS = {
         "sky3d": True,
         # brush textures that vanish with distance by their own mips get faces that fade out
         "mip_fade": True,
+        # brush faces come from a BSP pass of the vmf (merged along shared edges, fewer light seams)
+        "merge_edges": False,
+        # shader of the plain ported materials (one of SHADER_CHOICES)
+        "default_shader": "csgo_lightmappedgeneric",
     },
 }
+
+# shaders the plain ported materials can get (shaders.py moves a material between them)
+SHADER_CHOICES = ("csgo_lightmappedgeneric", "csgo_environment", "csgo_complex")
 
 # the only keys kept between starts (the settings); everything else starts from DEFAULTS
 SAVED = ("lang", "theme", "maximized", "cs2_dir", "resource_dirs", "skip_update", "bhop_blocks_user", "opts")

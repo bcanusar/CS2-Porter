@@ -295,11 +295,14 @@ class ValveTools:
         return code == 0 or failed == 0, failed, out
 
     # --- map importer (map only) ---------------------------------------------
-    def import_map(self, gameinfo_dir, content_root, map_name, addon):
-        """gameinfo_dir: the 'csgo' folder made by s1stub.build_stub_game."""
+    def import_map(self, gameinfo_dir, content_root, map_name, addon, use_bsp=False):
+        """gameinfo_dir: the 'csgo' folder made by s1stub.build_stub_game.
+        use_bsp: source1import first runs CS2's own vbsp (import_scripts/bin/vbsp.exe -prepfors2)
+        on the vmf and takes the cleaned BSP faces as the brush geometry: faces of touching
+        brushes are merged along shared edges, so the lightmap has fewer seams there."""
         src1import = self.exe("source1import.exe")
         cwd = os.path.join(self.cs2_dir, "game", "csgo", "import_scripts")
-        args = [src1import, "-retail", "-nop4", "-nop4sync",
+        args = [src1import, "-retail", "-nop4", "-nop4sync"] + (["-usebsp"] if use_bsp else []) + [
                 "-src1gameinfodir", os.path.normpath(gameinfo_dir),
                 "-src1contentdir", os.path.normpath(content_root),
                 "-s2addon", addon, "-game", "csgo", f"maps\\{map_name}.vmf"]

@@ -7,12 +7,16 @@
   the map's script checks the player's speed and fires them
 - trigger_momentum_slide -> trigger_multiple; the map's script takes the ground friction away
   inside it and lets the player slide down slopes
+- trigger_momentum_push -> trigger_multiple; on start and / or end touch (spawnflags) the map's
+  script changes the player's velocity once, as Momentum Mod does: set, add, set / add when
+  slower than the push, base velocity (added once) or a variable push spread over a duration
 
 The script is made with the triggers' settings, compiled into the addon's game folder
 (scripts/cs2porter_momentum.vjs_c) and added to the map with a point_script (SCRIPT_REF).
 """
 
 import json
+import math
 import os
 
 SCRIPT_FILE = "scripts/cs2porter_momentum.js"
@@ -22,6 +26,13 @@ NAME_PREFIX = "cs2porter_momentum_"
 TELEPORT = "trigger_momentum_teleport"
 SPEED = "trigger_momentum_speedthreshold"
 SLIDE = "trigger_momentum_slide"
+PUSH = "trigger_momentum_push"
+
+# trigger_momentum_push spawnflags
+PUSH_DIR_AS_FORCE = 1 << 19
+PUSH_ON_START = 1 << 21
+PUSH_ON_END = 1 << 22
+PUSH_KEYS = ("pushdir", "force", "increase", "varpushduration", "varpushbias", "varpushincrease")
 
 
 def _on(ent, key, default="1"):
@@ -56,10 +67,35 @@ def _script_name(ent, used, entry):
     return name
 
 
+def _push_entry(ent):
+    """The push of a trigger_momentum_push: its world velocity (pushdir angles times force) and
+    when and how it is applied."""
+    try:
+        ang = [float(x) for x in (ent.get("pushdir") or "0 0 0").split()[:3]]
+    except ValueError:
+        ang = [0.0, 0.0, 0.0]
+    while len(ang) < 3:
+        ang.append(0.0)
+    p, y = math.radians(ang[0]), math.radians(ang[1])
+    vec = [math.cos(p) * math.cos(y), math.cos(p) * math.sin(y), -math.sin(p)]
+    try:
+        flags = int(float((ent.get("spawnflags") or str(PUSH_ON_END)).strip()))
+    except ValueError:
+        flags = PUSH_ON_END
+    force = 1.0 if flags & PUSH_DIR_AS_FORCE else _num(ent, "force", 300.0)
+    mode = int(_num(ent, "increase", 3.0))
+    return {"vec": [round(v * force, 4) for v in vec], "mode": mode if 0 <= mode <= 5 else 0,
+            "start": bool(flags & PUSH_ON_START), "end": bool(flags & PUSH_ON_END),
+            "duration": max(_num(ent, "varpushduration", 1.0), 0.0),
+            "bias": min(max(_num(ent, "varpushbias", 0.5), 0.001), 0.999),
+            "increasing": _on(ent, "varpushincrease", "0")}
+
+
 def convert(root, data):
     """Converts the Momentum triggers of a parsed VMF. data receives the script's settings:
-    {"teleport": [...], "speed": [...], "slide": [...]}. Returns (teleports, speed, slide)."""
-    counts = [0, 0, 0]
+    {"teleport": [...], "speed": [...], "slide": [...], "push": [...]}.
+    Returns (teleports, speed, slide, push)."""
+    counts = [0, 0, 0, 0]
     used = {}
     for ent in root.children("entity"):
         cls = ent.classname
@@ -95,7 +131,16 @@ def convert(root, data):
             entry = dict(entry, name=_script_name(ent, used, entry))
             data.setdefault("slide", []).append(entry["name"])
             counts[2] += 1
-    for k in ("teleport", "speed"):
+        elif cls == PUSH:
+            entry = _push_entry(ent)
+            _set_class(ent, "trigger_multiple")
+            for k in PUSH_KEYS:
+                ent.remove_key(k)
+            entry = dict(entry, name=_script_name(ent, used, entry))
+            if entry["start"] or entry["end"]:
+                data.setdefault("push", []).append(entry)
+            counts[3] += 1
+    for k in ("teleport", "speed", "push"):
         if k in data:
             # one entry per name (split triggers share theirs)
             seen = {}
@@ -108,7 +153,7 @@ def convert(root, data):
 
 
 def needs_script(data):
-    return bool(data and any(data.get(k) for k in ("teleport", "speed", "slide")))
+    return bool(data and any(data.get(k) for k in ("teleport", "speed", "slide", "push")))
 
 
 def write_script(content_dir, data):
@@ -116,7 +161,7 @@ def write_script(content_dir, data):
     its path."""
     path = os.path.join(content_dir, *SCRIPT_FILE.split("/"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    table = json.dumps({k: data.get(k, []) for k in ("teleport", "speed", "slide")}, indent=4)
+    table = json.dumps({k: data.get(k, []) for k in ("teleport", "speed", "slide", "push")}, indent=4)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(SCRIPT.replace("/*DATA*/", table))
     return path
@@ -278,6 +323,39 @@ function slide(st, dt) {
     if (vx !== v.x || vy !== v.y) pawn.Teleport({ velocity: { x: vx, y: vy, z: v.z } });
 }
 
+// --- push (trigger_momentum_push) ------------------------------------------------------------
+
+const TICK = 1 / 64;
+let varPushes = [];            // { pawn, vec, ticks, done, bias, increasing }
+
+const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+const lenSq = (v) => v.x * v.x + v.y * v.y + v.z * v.z;
+const bias = (x, b) => Math.pow(Math.max(x, 0), Math.log(b) / Math.log(0.5));
+
+function push(e, pawn) {
+    const cur = pawn.GetAbsVelocity();
+    let vel = { x: e.vec[0], y: e.vec[1], z: e.vec[2] };
+    switch (e.mode) {
+        case 1: vel = add(vel, cur); break;                                   // add
+        case 2: if (lenSq(vel) < lenSq(cur)) vel = cur; break;                // set if lower
+        case 3: if (lenSq(vel) < lenSq(cur)) vel = add(vel, cur); break;      // add if lower
+        case 4: vel = add(vel, cur); break;                                   // base velocity: added once
+        case 5:                                                               // variable push
+            varPushes.push({ pawn: pawn, vec: vel, ticks: Math.max(Math.ceil(e.duration / TICK), 1),
+                             done: 0, bias: e.bias, increasing: e.increasing });
+            return;
+    }
+    pawn.Teleport({ velocity: vel });
+}
+
+function varPush(st) {
+    let f = st.ticks > 1 ? st.done / (st.ticks - 1) : 1;
+    if (!st.increasing) f = 1 - f;
+    const k = bias(f, st.bias);
+    st.pawn.Teleport({ velocity: add(st.pawn.GetAbsVelocity(), { x: st.vec.x * k, y: st.vec.y * k, z: st.vec.z * k }) });
+    st.done++;
+}
+
 // --- setup -------------------------------------------------------------------------------
 
 function connect(name, start, end) {
@@ -302,6 +380,10 @@ function init() {
     connections = [];
     speedTouch.clear();
     slideTouch.clear();
+    varPushes = [];
+    for (const e of DATA.push) {
+        connect(e.name, e.start ? (t, p) => push(e, p) : () => {}, e.end ? (t, p) => push(e, p) : null);
+    }
     for (const e of DATA.teleport) connect(e.name, (t, p) => teleport(e, p));
     for (const e of DATA.speed) connect(e.name, (t, p) => speedStart(e, t, p), (t, p) => speedEnd(e, p));
     for (const name of DATA.slide) connect(name, (t, p) => slideStart(p), (t, p) => slideEnd(p));
@@ -333,6 +415,8 @@ Instance.SetThink(() => {
         }
         slide(st, dt);
     }
+    varPushes = varPushes.filter((st) => st.pawn.IsValid() && st.pawn.IsAlive() && st.done < st.ticks);
+    for (const st of varPushes) varPush(st);
 });
 Instance.SetNextThink(Instance.GetGameTime());
 """

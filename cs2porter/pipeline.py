@@ -505,7 +505,8 @@ def convert_assets(cfg, ctx, report, sources, materials, models, content_dir, ga
     matconv = MaterialConverter(sources, index, content_dir, config.VTFCMD, ctx.log,
                                 overwrite=opts.get("overwrite", False),
                                 convert_cs2_existing=opts.get("convert_cs2_existing", False),
-                                texture_lights=texture_lights, fullbright=fullbright)
+                                texture_lights=texture_lights, fullbright=fullbright,
+                                default_shader=opts.get("default_shader"))
     qc_index = QCIndex(sources.resource_sources(), config.CACHE_DIR, ctx.log)
     if qc_index.by_model:
         ctx.log(t("p_qc_index", n=len(qc_index.by_model)), "dim")
@@ -1214,6 +1215,44 @@ _VMDL_REF_RE = re.compile(r'(\b(?:to|global_default_material)\s*=\s*)"([^"]+\.vm
                           r'([ \t]*// cs2porter placeholder for (\S+\.vmat))?', re.I)
 
 
+_VMDL_FROM_RE = re.compile(r'\bfrom\s*=\s*"([^"]+\.vmat)"', re.I)
+
+
+def _default_remaps(text, have):
+    """Skin groups only remap the other skins; the meshes still name their own materials. A
+    material that a skin group remaps but that is missing everywhere gets an entry of its own in
+    the DefaultMaterialGroup (added when the model has none, as in the importer's models), so
+    the placeholder also reaches the base skin."""
+    if "\r\n" in text:
+        return _default_remaps(text.replace("\r\n", "\n"), have).replace("\n", "\r\n")
+    m = re.search(r'^([ \t]*)_class = "MaterialGroupList"\n\1children = \n\1\[\n', text, re.M)
+    if not m:
+        return text
+    ind = m.group(1)
+    dm = re.search(r'^([ \t]*)_class = "DefaultMaterialGroup"\n(?:\1.*\n)*?\1remaps = \n\1\[\n', text, re.M)
+    known = set()
+    if dm:
+        end = text.find(f"\n{dm.group(1)}]", dm.end() - 1)
+        known = {v.replace("\\", "/").lower() for v in _VMDL_FROM_RE.findall(text, dm.end(), end)}
+    missing = []
+    for v in _VMDL_FROM_RE.findall(text):
+        v = v.replace("\\", "/").lower()
+        if v.startswith("materials/") and v not in known and v not in missing and not have(v):
+            missing.append(v)
+    if not missing:
+        return text
+    if dm:
+        t = dm.group(1)
+        entries = "".join(f'{t}\t{{\n{t}\t\tfrom = "{v}"\n{t}\t\tto = "{v}"\n{t}\t}},\n' for v in missing)
+        return text[:dm.end()] + entries + text[dm.end():]
+    t = ind + "\t\t"
+    entries = "".join(f'{t}\t{{\n{t}\t\tfrom = "{v}"\n{t}\t\tto = "{v}"\n{t}\t}},\n' for v in missing)
+    block = (f'{ind}\t{{\n{ind}\t\t_class = "DefaultMaterialGroup"\n{ind}\t\tremaps = \n{ind}\t\t[\n'
+             f'{entries}{ind}\t\t]\n{ind}\t\tuse_global_default = false\n'
+             f'{ind}\t\tglobal_default_material = ""\n{ind}\t}},\n')
+    return text[:m.end()] + block + text[m.end():]
+
+
 def model_placeholders(cfg, ctx, content_dir, game_dir, only=None):
     """Puts PLACEHOLDER_VMAT into the remaps of the addon's models whose material is neither in
     the addon nor in CS2 (and the real material back once it is there). Every model that uses a
@@ -1237,12 +1276,16 @@ def model_placeholders(cfg, ctx, content_dir, game_dir, only=None):
                 continue
             if not _VMDL_REF_RE.search(text):
                 continue
+            orig_text = text
             if index is None:
                 index = CS2Index(cfg.get("cs2_dir", ""), content_dir, game_dir)
             hits = []
 
             def have(vmat):
                 return index.in_addon(vmat) or index.in_cs2(vmat + "_c")
+
+            if on:
+                text = _default_remaps(text, have)
 
             def sub(m):
                 key, vmat, _mark, orig = m.groups()
@@ -1258,7 +1301,7 @@ def model_placeholders(cfg, ctx, content_dir, game_dir, only=None):
                 return f'{key}"{PLACEHOLDER_VMAT}" {_PH_MARK}{v}'
 
             new = _VMDL_REF_RE.sub(sub, text)
-            if new != text:
+            if new != orig_text:
                 with open(path, "w", encoding="utf-8", newline="") as fh:
                     fh.write(new)
             if not hits:
@@ -2085,6 +2128,16 @@ def _beam_notice(report, stats):
         report.notices.append("\n\n".join(parts))
 
 
+# instance vmf that holds the brush entities with displacements during the BSP pass
+DISP_INSTANCE = "cs2p_disps"
+
+
+def _bsp_skipped(out):
+    """True when source1import could not use the BSP pass and took the plain vmf brushes."""
+    low = out.lower()
+    return any(k in low for k in ("vbsp failed", "invalid bsp", "failed to load bsp"))
+
+
 def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials, skyname,
                 map_name, addon, cs2_ok, aliases=None, extra=(), tex_sizes=None):
     """Imports the map as a .vmap, then the extra maps of the same folder (the 3D skybox).
@@ -2113,8 +2166,26 @@ def _import_map(cfg, ctx, report, valve, sources, work, content_root, materials,
             vmap = os.path.join(maps_dir, f"{name}.vmap")
             ref = os.path.join(maps_dir, f"{name}_refs.txt")
             started = time.time() - 2
+            use_bsp = bool(cfg.get("opts", {}).get("merge_edges", True))
+            src_vmf = os.path.join(content_root, "maps", f"{name}.vmf")
+            plain = None
+            if use_bsp:
+                try:
+                    with open(src_vmf, "rb") as f:
+                        plain = f.read()
+                    vmfmod.split_disp_entities(src_vmf, f"prefabs/{name}/{DISP_INSTANCE}.vmf")
+                except (OSError, ValueError) as e:
+                    ctx.log(str(e), "warn")
             try:
-                ok, _out = valve.import_map(gi, content_root, name, addon)
+                ok, out = valve.import_map(gi, content_root, name, addon, use_bsp)
+                if use_bsp and ok and _bsp_skipped(out):
+                    ctx.log(t("p_merge_edges_vmf"), "warn")
+                elif use_bsp and not ok and not (ctx.cancel and ctx.cancel.is_set()):
+                    ctx.log(t("p_merge_edges_retry"), "warn")
+                    if plain is not None:
+                        with open(src_vmf, "wb") as f:
+                            f.write(plain)
+                    ok, out = valve.import_map(gi, content_root, name, addon)
             except ToolError as e:
                 ctx.log(str(e), "err")
                 ok = False

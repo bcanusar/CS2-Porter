@@ -874,6 +874,11 @@ TOOLS = [
     {"id": "textures", "group": "assets", "name": "t_tex_name", "desc": "t_tex_desc",
      "exts": tuple(sorted(jpg_converter.TEXTURE_EXT)),
      "rows": "textures", "options": {}, "run": run_textures, "switches": (("decal", "sw_decal", False),)},
+    # tools that work on an addon in place; they have their own panel (addon_panels.py)
+    {"id": "shader", "group": "addon", "name": "t_shader_name", "desc": "t_shader_desc", "panel": "shader",
+     "exts": (), "options": {}},
+    {"id": "sound", "group": "addon", "name": "t_sound_name", "desc": "t_sound_desc", "panel": "sound",
+     "exts": (), "options": {}},
 ]
 
 

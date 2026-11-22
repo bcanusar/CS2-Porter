@@ -2,6 +2,7 @@
 
 import collections
 import math
+import os
 import random
 import re
 
@@ -115,6 +116,48 @@ def write_vmf(root, path):
             emit(item, 0)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.writelines(out)
+
+
+def _has_disp(ent):
+    return any(side.child("dispinfo") is not None
+               for solid in ent.children("solid") for side in solid.children("side"))
+
+
+def split_disp_entities(vmf_path, inst_file):
+    """vbsp only takes displacements in the world and func_detail; a brush entity holding one
+    (e.g. the walk-through displacements moved into a func_illusionary) stops the BSP pass of
+    the import. Such entities move to inst_file (relative to the map's folder) and the map gets
+    a func_instance of it: the import leaves instances out of the BSP pass and brings them back
+    as a prefab, which is collapsed into the map later. Returns the number of entities moved."""
+    root = parse_vmf(vmf_path)
+    moved, keep = [], []
+    for item in root.items:
+        if isinstance(item, VNode) and item.name.lower() == "entity"                 and (item.classname or "").lower() != "func_detail" and _has_disp(item):
+            moved.append(item)
+        else:
+            keep.append(item)
+    if not moved:
+        return 0
+    inst = VNode("root")
+    ver = VNode("versioninfo")
+    ver.items = [["editorversion", "400"], ["editorbuild", "9999"], ["mapversion", "1"],
+                 ["formatversion", "100"], ["prefab", "0"]]
+    world = VNode("world")
+    world.items = [["id", "1"], ["mapversion", "1"], ["classname", "worldspawn"]]
+    inst.items = [ver, world] + moved
+    _fix_base(inst)
+    path = os.path.join(os.path.dirname(vmf_path), *inst_file.split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_vmf(inst, path)
+    ids = [int(i[1]) for n in keep if isinstance(n, VNode) for i in n.items
+           if isinstance(i, list) and i[0].lower() == "id" and i[1].isdigit()]
+    ent = VNode("entity")
+    ent.items = [["id", str(max(ids, default=0) + 1)], ["classname", "func_instance"],
+                 ["file", inst_file], ["fixup_style", "2"],
+                 ["angles", "0 0 0"], ["origin", "0 0 0"]]
+    root.items = keep + [ent]
+    write_vmf(root, vmf_path)
+    return len(moved)
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1546,36 @@ def _push_pads_on_start_touch(root):
         if all(min(hi[k] - lo[k] for k in range(3)) <= PUSH_PAD_MAX for lo, hi in boxes):
             ent.set("triggeronstarttouch", "1")
             count += 1
+    return count
+
+
+# pushdir pitch at most this far from straight up / down counts as a vertical push
+PUSH_VERTICAL_TOLERANCE = 1.0
+
+
+def _num_text(v):
+    """A number for a key value: dot decimal, no trailing zeros."""
+    return f"{v:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _vertical_push_speed(root):
+    """A vertical trigger_push (pushdir straight up or down) that pushes on every tick inside:
+    Source 1 sets the player's base velocity to 'speed', CS2 adds 'speed' to the velocity on
+    every tick (64 a second), so the CS2 speed is the Source 1 one / 64. Pads that push on start
+    touch only keep their speed. Returns the number changed."""
+    count = 0
+    for ent in root.children("entity"):
+        if ent.classname != "trigger_push" or (ent.get("triggeronstarttouch") or "0").strip() == "1":
+            continue
+        try:
+            pitch = float((ent.get("pushdir") or "0 0 0").split()[0])
+            speed = float((ent.get("speed") or "40").strip())
+        except (ValueError, IndexError):
+            continue
+        if abs(abs(pitch) - 90.0) > PUSH_VERTICAL_TOLERANCE or speed == 0:
+            continue
+        ent.set("speed", _num_text(speed / 64.0))
+        count += 1
     return count
 
 
@@ -3243,7 +3316,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["empty"] = _remove_empty_brush_entities(root)
     stats["zones"] = _zones_to_triggers(root)
     from . import momentum as momentummod
-    stats["mom_teleports"], stats["mom_speed"], stats["mom_slide"] = \
+    stats["mom_teleports"], stats["mom_speed"], stats["mom_slide"], stats["mom_push"] = \
         momentummod.convert(root, momentum if momentum is not None else {})
     stats["lifted"] = _lift_spawns(root)
     stats["spawns"] = _fill_spawns(root)
@@ -3254,6 +3327,7 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
     stats["trigger_clip"] = _world_triggers_to_clip(root)
     stats["booster"] = _remove_booster_filter(root)
     stats["push_pads"] = _push_pads_on_start_touch(root)
+    stats["push_vertical"] = _vertical_push_speed(root)
     stats["anim_inputs"] = _animation_inputs(root)
     stats["material_controls"] = _idle_material_controls(root)
     stats["overlays"] = _faceless_overlays(root)
@@ -3354,7 +3428,8 @@ def fix_for_cs2(root, sky_alias=None, attributes=None, meshes=None, teleport_key
                   "booster", "filters", "meshes", "teleports", "boost", "split", "floor", "effects", "removed",
                   "bhop_blocks", "flag_triggers", "trigger_clip", "cubemaps", "zones", "spawns", "nonsolid",
                   "landmarks", "weaponstrip", "beam_sparks", "int_keys", "empty", "lifted", "push_pads",
-                  "anim_inputs", "material_controls", "overlays", "mom_teleports", "mom_speed", "mom_slide"):
+                  "anim_inputs", "material_controls", "overlays", "mom_teleports", "mom_speed", "mom_slide", "mom_push",
+                  "push_vertical"):
             if stats.get(k):
                 parts.append(t("vf_" + k, n=stats[k]))
         log(t("vf_title", parts=", ".join(parts) if parts else t("vf_none")), "ok")

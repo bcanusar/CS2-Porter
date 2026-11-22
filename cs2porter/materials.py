@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from . import kv
+from . import shaders as shadersmod
 from . import texlights
 from . import vtf as vtfmod
 from .i18n import t
@@ -293,6 +294,20 @@ def unlit_vmat(color, translucency=None, blend=0, tint=None, scroll=None, backfa
     if translucency:
         lines += [f"{T}//---- Translucent ----", f'{T}TextureTranslucency "{translucency}"', ""]
     return "\n".join(lines) + "}\n"
+
+
+_BACKFACE_SHADERS = ("csgo_complex.vfx", "csgo_lightmappedgeneric.vfx", "csgo_unlitgeneric.vfx",
+                     "csgo_foliage.vfx", "csgo_environment.vfx")
+_SHADER_LINE_RE = re.compile(r'^([ \t]*)shader "([^"]+)"[^\n]*\n', re.M)
+
+
+def _nocull(content, vmt):
+    """$nocull draws both sides of a face in Source 1; CS2 does the same with F_RENDER_BACKFACES."""
+    m = _SHADER_LINE_RE.search(content)
+    if (not vmt.flag("$nocull") or not m or m.group(2).lower() not in _BACKFACE_SHADERS
+            or "F_RENDER_BACKFACES" in content):
+        return content
+    return content[:m.end()] + f"{m.group(1)}F_RENDER_BACKFACES 1\n" + content[m.end():]
 
 
 def additive_vmat(color, scroll=None):
@@ -855,8 +870,11 @@ class MaterialConverter:
     """Writes the missing materials into a target content folder (addon)."""
 
     def __init__(self, sources, index, content_dir, vtfcmd=None, log=None,
-                 overwrite=False, convert_cs2_existing=False, texture_lights=None, fullbright=False):
+                 overwrite=False, convert_cs2_existing=False, texture_lights=None, fullbright=False,
+                 default_shader=None):
         self.sources = sources
+        # shader of the plain materials (shaders.py); csgo_lightmappedgeneric when not set
+        self.default_shader = shadersmod.shader_name(default_shader) if default_shader else shadersmod.LMG
         # the map has no baked light (lighting.fullbright_map): its lit world materials become
         # unlit, as bright as Source 1 drew them
         self.fullbright = fullbright
@@ -1711,6 +1729,14 @@ class MaterialConverter:
             if opacity < 0.999:
                 # $alpha on top of a translucent texture
                 content = content.replace('g_flOpacityScale "1.000"', f'g_flOpacityScale "{opacity:.3f}"')
+            if tag in ("basic", "normal map", "translucent") and self.default_shader != shadersmod.LMG:
+                # the default shader of the settings; a material it cannot show keeps its own
+                new, _why = shadersmod.convert(content, self.default_shader,
+                                               alphatest=vmt.flag("$alphatest") and not vmt.flag("$translucent"))
+                if new:
+                    content = new
+                    tag += ", " + self.default_shader[:-4]
+        content = _nocull(content, vmt)
 
         os.makedirs(os.path.dirname(vmat_abs), exist_ok=True)
         with open(vmat_abs, "w", encoding="utf-8") as f:
